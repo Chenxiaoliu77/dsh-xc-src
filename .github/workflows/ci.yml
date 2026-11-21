@@ -1,0 +1,463 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, next]
+  pull_request:
+    branches: [main, next]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  pre_job:
+    name: Pre-job (Skip Duplicate Actions)
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+    steps:
+      - id: skip_check
+        uses: fkirc/skip-duplicate-actions@v5.3.2
+        with:
+          concurrent_skipping: same_content
+          skip_after_successful_duplicate: true
+          paths_ignore: '["**/docs/**", "**/*.md"]'
+
+  # 子仓库指针一致性前置（issue #1384）：发布顺序出错时，指针会先于子仓库推送，
+  # 之后所有平台的 Checkout 会各自报一遍 `not our ref`，看起来像 5 个平台同时崩。
+  # 这里先用 `git ls-remote` 逐个确认指针在远端可达，不可达立刻以明确信息失败，
+  # 一次说清是哪几个子仓库、哪些提交。
+  submodules:
+    name: Submodule pointer reachability
+    needs: pre_job
+    if: ${{ needs.pre_job.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - name: Verify every submodule pointer is reachable
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed=0
+          # `git ls-files -s` 每行是 `<mode> <sha> <stage>\t<path>`：stage 与路径之间是
+          # 制表符，路径正好是 .gitmodules 里的子仓库名。
+          while read -r mode sha rest; do
+            [ "${mode}" = "160000" ] || continue
+            name=${rest#*$'\t'}
+            url=$(git config --file .gitmodules --get "submodule.${name}.url") || {
+              echo "::error::submodule ${name}: no url in .gitmodules"
+              failed=1
+              continue
+            }
+            # 直接按 SHA 拉取：指针指向祖先提交时 `git ls-remote` 根本不会列出它，只有
+            # 服务端真的拿不出这个对象才会失败——正是 Checkout 阶段报 `not our ref` 的原因。
+            tmp=$(mktemp -d)
+            if output=$(git init -q "${tmp}" && git -C "${tmp}" fetch -q --depth 1 "${url}" "${sha}" 2>&1); then
+              echo "ok ${name} ${sha}"
+            else
+              detail=$(printf '%s' "${output}" | tr '\n' ' ')
+              echo "::error::submodule ${name}: commit ${sha} is not reachable on ${url} (${detail}); the pointer was pushed before the submodule. Push it first, then re-run."
+              failed=1
+            fi
+            rm -rf "${tmp}"
+          done < <(git ls-files -s)
+          exit "${failed}"
+
+  # 按改动选择测试范围（issue #1059）。
+  #
+  # 基线取 PR 目标分支与待测提交的共同祖先，不是最后一个提交：只比 HEAD 会漏掉
+  # 同一 PR 先前的提交。未开启 PR 或基线获取失败时 `full=true`，全量兜底——
+  # 影响范围不确定时永远跑全量，不静默跳过。
+  changes:
+    name: Detect changed scope
+    needs: pre_job
+    if: ${{ needs.pre_job.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.scope.outputs.full }}
+      base: ${{ steps.scope.outputs.base }}
+      unit: ${{ steps.scope.outputs.unit }}
+      rust: ${{ steps.scope.outputs.rust }}
+      desktop: ${{ steps.scope.outputs.desktop }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # --changed 与 merge-base 都要真实历史；depth=1 会让两者退化成「全部」。
+          fetch-depth: 0
+          submodules: false
+
+      - name: Compute scope
+        id: scope
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          full=0; rust=0; unit=0; desktop=0; base=''; reason='classified changed paths'
+          changed_file=''
+          if [ "$EVENT" != 'pull_request' ] || [ -z "$BASE_REF" ]; then
+            full=1; reason='not a pull request; run all groups'
+          elif ! git fetch --no-tags --prune origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"; then
+            full=1; reason='target branch fetch failed; run all groups'
+          elif ! base=$(git merge-base "origin/${BASE_REF}" HEAD); then
+            full=1; reason='merge base unavailable; run all groups'
+          else
+            changed_file=$(mktemp)
+            if ! git diff --name-only -z "$base...HEAD" > "$changed_file"; then
+              full=1; reason='changed paths unavailable; run all groups'
+            else
+              mapfile -d '' changed < "$changed_file"
+              printf 'base=%s\nchanged paths:\n' "$base"
+              for path in "${changed[@]}"; do
+                printf '  %q\n' "$path"
+                file=${path##*/}
+                case "$path" in
+                  .github/*|scripts/*) full=1; reason='shared CI or scripts changed; run all groups' ;;
+                  crates/*|apps/desktop/src-tauri/*) rust=1; desktop=1 ;;
+                  apps/desktop/src/*|packages/*) unit=1; desktop=1 ;;
+                  tests/e2e/*|apps/desktop/tests/e2e/*) desktop=1 ;;
+                  apps/desktop/tests/unit/*|tests/*) unit=1 ;;
+                  apps/desktop/*) desktop=1 ;;
+                  *) full=1; reason='unclassified path; run all groups' ;;
+                esac
+                case "$file" in
+                  package.json|pnpm-lock.yaml|pnpm-workspace.yaml|Cargo.lock|Cargo.toml|tauri.conf.json|rust-toolchain*|tsconfig*|vite.config.*|vitest*|playwright*|eslint*|webpack*|rollup*|*.config.*|*.test.json|*.build.json|build.rs|manifest*)
+                    full=1; reason='shared manifest, build or test configuration changed; run all groups' ;;
+                esac
+              done
+            fi
+            if [ -n "$changed_file" ]; then rm -f "$changed_file"; fi
+          fi
+          if [ "$full" -eq 1 ]; then rust=1; unit=1; desktop=1; base=''; fi
+          printf 'groups=rust:%s,unit:%s,desktop:%s fallback=%s\n' "$rust" "$unit" "$desktop" "$full"
+          for key in full base rust unit desktop reason; do printf '%s=%s\n' "$key" "${!key}" >> "$GITHUB_OUTPUT"; done
+
+  native:
+    name: Native typecheck and unit tests
+    needs: [pre_job, changes]
+    if: ${{ needs.pre_job.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check native subproject
+        run: pnpm run typecheck:native
+
+      - name: Native unit test
+        run: pnpm run test:native
+
+  unit:
+    name: Unit Tests (vitest)
+    needs: [pre_job, changes]
+    if: ${{ needs.pre_job.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scope
+        run: |
+          echo "baseline=${{ needs.changes.outputs.base }}"
+          echo "full=${{ needs.changes.outputs.full }}"
+          echo "reason=${{ needs.changes.outputs.reason }}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test workspace release versioning and immutable source guards
+        run: node .github/scripts/check-mobile-release.mjs
+
+      - name: Test archived core native bridge and profile module identity
+        run: node --test apps/desktop/src-tauri/src/service/core/asar-native.test.cjs apps/desktop/src-tauri/src/service/profile/carrier.test.cjs
+
+      - name: Test iOS signing and Beta review guards without credentials
+        run: python3 -m unittest discover -s .github/scripts -p 'test_ios_*.py' -v
+
+      - name: Type check sources before generating declarations
+        run: pnpm run typecheck
+
+      - name: Build core packages
+        run: pnpm --filter dsh-tauri build && pnpm --filter dsh-tauri-ui build
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Build renderer
+        run: pnpm --filter dsh-desktop build
+
+      # PR 用 Vitest 原生 --changed 按模块依赖图选测；主分支与兜底全量单轮。
+      # 选择结果由 Vitest 打印，这里只在兜底时显式说明原因。
+      - name: Unit test (full)
+        if: ${{ needs.changes.outputs.full == '1' }}
+        run: |
+          echo "fallback to full suite: ${{ needs.changes.outputs.reason }}"
+          node node_modules/vitest/vitest.mjs run --project unit
+
+      - name: Unit test (changed)
+        if: ${{ needs.changes.outputs.full != '1' && needs.changes.outputs.unit == '1' }}
+        run: node node_modules/vitest/vitest.mjs run --project unit --changed "${{ needs.changes.outputs.base }}"
+
+      - name: Unit test (not selected)
+        if: ${{ needs.changes.outputs.full != '1' && needs.changes.outputs.unit != '1' }}
+        run: |
+          echo "unit tests not selected: ${{ needs.changes.outputs.reason }}"
+
+  # Rust 单测与桌面 CDP E2E 同一环境共用一次编译：pnpm install 只落宿主平台的
+  # 原生可选依赖，交叉架构跑会漏装另一侧（issue #1326），因此两个矩阵必须逐项同构。
+  # 合并前是两条独立 job，各自 checkout / install / 编译一遍，5 个平台白跑两轮。
+  rust-e2e:
+    name: Rust tests & Desktop CDP E2E (${{ matrix.runner }})
+    # 指针不可达时直接跳过：5 个平台各自 Checkout 报一遍同样的 `not our ref`，只会把
+    # 一条环境问题放大成「整批全崩」（issue #1384）。
+    needs: [pre_job, changes, submodules]
+    if: ${{ needs.pre_job.outputs.should_skip != 'true' && (needs.changes.outputs.full == '1' || needs.changes.outputs.rust == '1' || needs.changes.outputs.desktop == '1') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+          - runner: macos-26
+            arch: arm64
+          - runner: macos-26-intel
+            arch: x64
+          - runner: windows-latest
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      DSH_RUST_SCOPE: ${{ needs.changes.outputs.full == '1' || needs.changes.outputs.rust == '1' }}
+      DSH_DESKTOP_SCOPE: ${{ needs.changes.outputs.full == '1' || needs.changes.outputs.desktop == '1' }}
+    steps:
+      - name: Scope
+        run: |
+          echo "full=${{ needs.changes.outputs.full }}"
+          echo "rust=${{ needs.changes.outputs.rust }}"
+          echo "desktop=${{ needs.changes.outputs.desktop }}"
+          echo "reason=${{ needs.changes.outputs.reason }}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      # 标签写错（例如把 x64 指到 Apple Silicon）不会报错，只会在错误架构上跑出一份
+      # 看似通过的绿灯，这里把 runner.arch 与矩阵声明对齐。
+      - name: Verify runner architecture
+        shell: bash
+        run: |
+          case "${{ matrix.arch }}" in
+            x64) expected=X64 ;;
+            arm64) expected=ARM64 ;;
+            *) echo "::error::unknown matrix arch '${{ matrix.arch }}'"; exit 1 ;;
+          esac
+          if [ "${{ runner.arch }}" != "$expected" ]; then
+            echo "::error::${{ matrix.runner }} is ${{ runner.arch }}, matrix declares ${{ matrix.arch }}"
+            exit 1
+          fi
+          echo "runner arch OK: ${{ runner.arch }}"
+
+      # standalone 只解决 Windows 上找不到 pnpm.exe 的问题；@pnpm/exe 没有
+      # darwin-x64 的可用二进制（pnpm#11423），在 Intel macOS runner 上会直接装不上。
+      - name: Setup Node.js and pnpm
+        uses: ./.github/actions/setup-node-pnpm
+        with:
+          standalone: ${{ runner.os == 'Windows' }}
+
+      - name: Expose pnpm.exe (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem "$env:USERPROFILE\setup-pnpm" -Recurse -Filter pnpm.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) {
+            npm install --no-save --prefix "$env:RUNNER_TEMP\pnpm-exe" '@pnpm/exe'
+            $exe = Get-ChildItem "$env:RUNNER_TEMP\pnpm-exe" -Recurse -Filter pnpm.exe | Select-Object -First 1
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $exe.DirectoryName
+          Write-Host "pnpm.exe: $($exe.FullName)"
+
+      # 不能加 --ignore-scripts：桌面端 E2E 依赖 electron 的 postinstall 落
+      # node_modules/electron/dist，缺了 dist 二进制就只能等运行时再下载。
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Rust 侧 dbus / appindicator / patchelf，桌面端侧 GTK 与 headless 的 xvfb。
+      # 镜像站偶发 5xx / 半截连接：固定 3 次尝试并打印重试序号，够了就停；失败仍以
+      # 退出码失败，不静默降级（issue #1384）。
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::Retries=3 update \
+              && sudo apt-get -y -o Acquire::Retries=3 install dbus libappindicator3-dev \
+                 librsvg2-dev patchelf libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 xvfb; then
+              echo "apt-get succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "::warning::apt-get attempt ${attempt}/3 failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          echo "::error::apt-get failed after 3 attempts"
+          exit 1
+
+      - name: Cache Electron distribution
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/electron
+            ~/Library/Caches/electron
+            ~/AppData/Local/electron/Cache
+          key: electron-45.0.0-${{ runner.os }}-${{ runner.arch }}
+
+      # 工具链固定到仓库验证过的版本（issue #1384）：@stable 会在任意一次运行时换
+      # 版本，rustup 组件下载与校验随之抖动，日志里表现为莫名的 checksum 失败重试。
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Setup Xcode
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/setup-xcode
+
+      # Rust 测试与桌面端都落在 apps/desktop/src-tauri/target；E2E 显式指定
+      # --target-dir 复用同一份 cache，避免两份 target 缓存互相覆盖。
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # dist 与 debug 产物必须就绪：Run 阶段的两条车道都要用到它们。
+      # 先编译一次二进制，Rust 测试与 E2E 随后并发跑，不再各自编译一遍。
+      - name: Build bundled plugins
+        if: env.DSH_DESKTOP_SCOPE == 'true'
+        run: pnpm run build:plugins
+
+      - name: Build renderer
+        if: env.DSH_DESKTOP_SCOPE == 'true'
+        run: pnpm --filter dsh-desktop build
+
+      - name: Build debug binary
+        if: env.DSH_DESKTOP_SCOPE == 'true'
+        run: cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --features tauri/custom-protocol
+
+      # E2E 用的二进制先复制到 RUNNER_TEMP：并发跑的 rust_lane 里 cargo test 会重建
+      # target/debug 下的同名产物，Windows 上被占用的 exe 还会让链接直接失败。
+      - name: Stage E2E binary
+        if: env.DSH_DESKTOP_SCOPE == 'true'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/dsh-e2e"
+          cp apps/desktop/src-tauri/target/debug/deepseek-harness-desktop* "$RUNNER_TEMP/dsh-e2e/"
+
+      - name: Runtime IPC readiness regression
+        if: env.DSH_DESKTOP_SCOPE == 'true'
+        shell: bash
+        run: |
+          root=$(node -p 'process.cwd().split(String.fromCharCode(92)).join(String.fromCharCode(47))')
+          config=(--manifest-path crates/tauri-runtime-electron/Cargo.toml --features tauri
+            --config "patch.crates-io.tauri-runtime.path=\"$root/apps/desktop/src-tauri/vendor/tauri-runtime\""
+            --config "patch.\"https://github.com/hairyf/electron-rs.git\".electron-rs.path=\"$root/crates/electron-rs\"")
+          sub_lock=crates/tauri-runtime-electron/Cargo.lock
+          cp "$sub_lock" "$sub_lock.orig"
+          trap 'mv -f "$sub_lock.orig" "$sub_lock"' EXIT
+          cp apps/desktop/src-tauri/Cargo.lock "$sub_lock"
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          cargo metadata "${config[@]}" --offline --filter-platform "$host" --format-version 1 > /dev/null
+          args=(cargo test "${config[@]}" --target-dir apps/desktop/src-tauri/target --locked --offline --lib ipc_readiness_)
+          listing=$("${args[@]}" -- --list)
+          if [[ "$listing" != *"runtime::tests::ipc_readiness_waits_for_manager_across_iterations: test"* ]]; then
+            echo "Runtime IPC readiness regression was not collected"
+            exit 1
+          fi
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            xvfb-run --auto-servernum "${args[@]}"
+          else
+            "${args[@]}"
+          fi
+
+      # 二进制已编译完成，两条车道互不依赖：并发跑，总耗时取较慢的一方而不是相加。
+      # E2E 只起 Electron 进程、不再调用 cargo，不会和 cargo test 抢 target 目录锁；
+      # 每条车道加 [rust] / [e2e] 前缀流式打印，卡在哪一侧一眼能看出来。
+      # 稳定性和 macOS 登录项变体验证需要多轮，按需在本地/手动触发执行，
+      # 仍随 PR 跑的是 Rust 侧既有用例，准入前需本地连跑 5 次无 Flake（issue #1059）。
+      - name: Run Rust tests and Desktop CDP E2E in parallel
+        shell: bash
+        run: |
+          set -uo pipefail
+          pids=()
+
+          rust_lane() {
+            cargo test --manifest-path crates/tauri-runtime-electron/tools/macos-sign/Cargo.toml --locked || return 1
+            ( cd apps/desktop/src-tauri && cargo test --all-features --locked ) || return 1
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              cargo test --manifest-path crates/tauri-plugin-notifications/Cargo.toml --lib --no-default-features || return 1
+            fi
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              cargo test --locked --manifest-path crates/tauri-runtime-electron/Cargo.toml --lib --test macos_native_loop --target-dir apps/desktop/src-tauri/target || return 1
+            fi
+          }
+
+          e2e_lane() {
+            export DSH_E2E_BINARY="$RUNNER_TEMP/dsh-e2e/deepseek-harness-desktop"
+            if [[ "$RUNNER_OS" == "Windows" ]]; then DSH_E2E_BINARY="$DSH_E2E_BINARY.exe"; export DSH_E2E_BINARY; fi
+            if [[ "$RUNNER_OS" == "Linux" ]]; then
+              DSH_E2E_HEADLESS=1 xvfb-run --auto-servernum node node_modules/vitest/vitest.mjs run --project desktop
+            else
+              node node_modules/vitest/vitest.mjs run --project desktop
+            fi
+          }
+
+          start_lane() {
+            local tag="$1"
+            shift
+            ( set -o pipefail; "$@" 2>&1 | sed "s/^/[$tag] /" ) &
+            pids+=("$!")
+          }
+
+          if [[ "$DSH_RUST_SCOPE" == 'true' ]]; then start_lane rust rust_lane; fi
+          if [[ "$DSH_DESKTOP_SCOPE" == 'true' ]]; then start_lane e2e e2e_lane; fi
+          if [[ ${#pids[@]} -eq 0 ]]; then
+            echo "no lane selected"
+            exit 0
+          fi
+
+          status=0
+          for pid in "${pids[@]}"; do
+            if ! wait "$pid"; then status=1; fi
+          done
+          exit "$status"

@@ -1,0 +1,1165 @@
+import type { Config } from '../config/schema'
+import type { MachineProfile, RemoteMachineStage, RemoteSession } from '../types/index'
+import type { BootstrapHooks, BootstrapLogLine, DshVersionInstallPlan, EnvCredentials, ReleaseAvailability, RemoteInstallPlan } from './bootstrap.types'
+import { Buffer } from 'node:buffer'
+import { readFileSync } from 'node:fs'
+import { messageOf } from '../../shared/error'
+import { BOOTSTRAP_LOG_PREFIX, DEFAULT_REMOTE_PROFILE, REMOTE_ROOT, remotePidfile } from '../config/constants'
+import { assetMatrixFor, dshNpmTarballUrls, dshZipDownloadUrls, NODE_SHASUMS256_SHA256, NODE_VERSION, nodeDownloadUrls, nodeShasumUrls, parsePlatform, PNPM_SHA256, PNPM_VERSION, pnpmDownloadUrls } from '../utils/assets'
+import { clientUrlsFromBootHtml, looksLikePluginBundle, releaseVersionFromBootHtml } from '../utils/boot-html'
+import { assertListenerProfile, listenerSnapshotCommand, parseListenerSnapshot, remoteInstanceStopCommand, remoteSlotClaimShell } from '../utils/instance'
+import { shQuote } from '../utils/shell'
+import { assertSupportedDshVersion, listGithubAssets, listGithubReleases, npmDistMetadata, parseGitHubRepo, parseVersionFromTag, pickReleaseTag, pkgRepoOf } from '../utils/version'
+
+/**
+ * 旧版桌面拉起的实例写的是整机一份的日志：同一台机器上多个实例都往里追加，
+ * 拿最后一行就会拿到别的实例的令牌。读令牌时按端口过滤它，见 remoteWebTokenCommand。
+ * issue #1573。
+ */
+const LEGACY_REMOTE_WEB_LOG = '.dsh/dsh-remote-web.log'
+
+/** 远端实例的日志：按端口区分，一个端口上的实例写自己那份。 */
+function remoteWebLog(port: number): string {
+  return `.dsh/dsh-remote-web-${port}.log`
+}
+
+const DSH_ZIP_ENTRY = 'node_modules/@deepseek-ai/dsh/lib/bin.js'
+
+const DSH_NPM_ENTRY = 'lib/bin.js'
+
+const PNPM_ENTRY = 'bin/pnpm.cjs'
+
+/**
+ * HEAD 探测发行包是否真的可下载。用来区分「release 被删」与「本机网络不通」：
+ * 前者必须换候选 tag，后者只能照旧把 URL 交给远端（远端网络可能正常）。
+ */
+async function probeReleaseDownload(url: string, timeoutMs = 8000): Promise<ReleaseAvailability> {
+  if (url === '')
+    return 'unknown'
+  try {
+    const response = await fetch(url, { method: 'HEAD', redirect: 'follow', signal: AbortSignal.timeout(timeoutMs) })
+    if (response.ok)
+      return 'available'
+    return response.status === 404 ? 'missing' : 'unknown'
+  }
+  catch {
+    return 'unknown'
+  }
+}
+
+function isNotFoundError(error: unknown): boolean {
+  const status = (error as { status?: number } | null)?.status
+  if (typeof status === 'number')
+    return status === 404
+  return messageOf(error).includes('HTTP 404')
+}
+
+const BOOTSTRAP_STAGES: Record<RemoteMachineStage, true> = {
+  probe: true,
+  download: true,
+  verify: true,
+  install: true,
+  launch: true,
+  ready: true,
+  failed: true,
+  auth: true,
+  reconnect: true,
+}
+
+function isBootstrapStage(value: string): value is RemoteMachineStage {
+  return (BOOTSTRAP_STAGES as Record<string, true | undefined>)[value] === true
+}
+
+export function parseBootstrapLine(chunk: string): BootstrapLogLine {
+  const match = /^::dsh (\w+) (.*)$/u.exec(chunk)
+  const stage = match?.[1]
+  if (match === null || stage === undefined || !isBootstrapStage(stage))
+    return { stage: 'install', line: chunk }
+  return { stage, line: match[2] ?? '' }
+}
+
+export function createBootstrapLineDispatcher(onLine: (line: string) => void): { push: (chunk: string) => void, flush: () => void } {
+  let pending = ''
+  return {
+    push(chunk: string): void {
+      pending = `${pending}${chunk}`
+      const lines = pending.split('\n')
+      pending = lines.pop() ?? ''
+      for (const line of lines) {
+        if (line !== '')
+          onLine(line)
+      }
+    },
+    flush(): void {
+      const line = pending
+      pending = ''
+      if (line !== '')
+        onLine(line)
+    },
+  }
+}
+
+export function skippedVerificationSummary(notes: string[], skipLines: string[]): string {
+  const items = [...new Set([...notes, ...skipLines].filter(item => item.includes('跳过')))]
+  return items.length === 0 ? '' : `；跳过校验项: ${items.join('；')}`
+}
+
+export function normalizeNpmIntegrity(integrity: string | undefined): string | undefined {
+  if (integrity === undefined)
+    return undefined
+  const sri = /^sha(256|512)-([A-Za-z0-9+/]+={0,2})$/u.exec(integrity)
+  if (sri !== null)
+    return `sha${sri[1]}:${Buffer.from(sri[2] ?? '', 'base64').toString('hex')}`
+  return integrity.startsWith('sha256:') || integrity.startsWith('sha512:') ? integrity : undefined
+}
+
+export async function planRemoteInstall(
+  unameOut: string,
+  config: Pick<Config, 'installRepo' | 'installRef'>,
+  fetchers: {
+    listReleases?: (repo: string) => Promise<{ tag: string, prerelease: boolean }[]>
+    listAssets?: (repo: string, tag: string) => Promise<Array<{ name: string, url: string, digest?: string }>>
+    npmDist?: (packageName: string, version: string) => Promise<{ url: string, mirrorUrl: string, integrity?: string }>
+    probe?: (url: string) => Promise<ReleaseAvailability>
+  } = {},
+): Promise<RemoteInstallPlan> {
+  const { os, arch } = parsePlatform(unameOut)
+  const ref = config.installRef?.trim()
+  if (ref !== undefined && ref !== '')
+    assertSupportedDshVersion(ref.startsWith('dsh-') ? parseVersionFromTag(ref) ?? '' : ref)
+  const matrix = assetMatrixFor(os, arch)
+  const repo = pkgRepoOf(config.installRepo)
+  const notes: string[] = []
+  const configuredRepo = config.installRepo?.trim()
+  if (configuredRepo !== undefined && configuredRepo !== '' && parseGitHubRepo(configuredRepo) === undefined)
+    notes.push(`installRepo "${configuredRepo}" 无法解析为 GitHub 仓库，回退官方发行仓 ${repo}`)
+  const listReleases = fetchers.listReleases ?? listGithubReleases
+  const listAssets = fetchers.listAssets ?? listGithubAssets
+  const npmDist = fetchers.npmDist ?? npmDistMetadata
+  const probe = fetchers.probe ?? probeReleaseDownload
+  let metas
+  try {
+    metas = await listReleases(repo)
+  }
+  catch (error) {
+    notes.push(`release 列表获取失败（${messageOf(error)}）`)
+  }
+  const resolved = pickReleaseTag(metas, { ref: config.installRef })
+  assertSupportedDshVersion(resolved.version)
+  notes.push(...resolved.notes.map(note => `版本选择: ${note}`))
+  const node = {
+    urls: nodeDownloadUrls(os, arch),
+    shasumUrls: nodeShasumUrls(),
+    shasumSha256: NODE_SHASUMS256_SHA256,
+    filename: matrix.nodeFilename,
+    version: NODE_VERSION,
+  }
+  const pnpm = { urls: pnpmDownloadUrls(), sha256: PNPM_SHA256, version: PNPM_VERSION }
+  if (matrix.dshKind === 'pkg-zip') {
+    const zipName = matrix.dshZipName ?? ''
+    let urls: string[] | undefined
+    let digest: string | undefined
+    let tag = resolved.tag
+    // 候选 tag 逐个验证：上游删掉 release 后 git tag 还在，发行包已 404。
+    const candidates = resolved.candidates.length > 0 ? resolved.candidates : [resolved.tag]
+    const availability = new Map<string, ReleaseAvailability>()
+    // 元数据不可达说明网络整体不通，继续逐个查询只会把失败路径拖长。
+    let metadataUnreachable = false
+    for (const candidate of candidates) {
+      if (metadataUnreachable) {
+        availability.set(candidate, 'unknown')
+        continue
+      }
+      try {
+        const assets = await listAssets(repo, candidate)
+        const asset = assets.find(item => item.name === zipName)
+        if (asset !== undefined) {
+          tag = candidate
+          urls = [asset.url, ...dshZipDownloadUrls(repo, candidate, zipName).slice(1)]
+          digest = asset.digest
+          availability.set(candidate, 'available')
+          break
+        }
+        availability.set(candidate, 'missing')
+        notes.push(`release ${candidate} 没有 ${zipName}，尝试下一个候选 tag`)
+      }
+      catch (error) {
+        const state = isNotFoundError(error) ? 'missing' : 'unknown'
+        availability.set(candidate, state)
+        notes.push(`release 资产元数据获取失败（${candidate}: ${messageOf(error)}）`)
+        if (state === 'unknown') {
+          metadataUnreachable = true
+          notes.push('release 元数据不可达，剩余候选不再逐个查询')
+        }
+      }
+    }
+    if (urls === undefined) {
+      // 元数据不可用时按候选顺序探测，确认可下载才写进脚本。
+      let probeUnreachable = false
+      for (const candidate of candidates) {
+        if (availability.get(candidate) === 'missing')
+          continue
+        if (probeUnreachable) {
+          availability.set(candidate, 'unknown')
+          continue
+        }
+        const candidateUrls = dshZipDownloadUrls(repo, candidate, zipName)
+        const state = await probe(candidateUrls[0] ?? '')
+        availability.set(candidate, state)
+        if (state === 'available') {
+          tag = candidate
+          urls = candidateUrls
+          break
+        }
+        if (state === 'unknown')
+          probeUnreachable = true
+        notes.push(`候选 release ${candidate} ${state === 'missing' ? '已确认不存在' : '可用性未知（网络不可达）'}`)
+      }
+      if (urls === undefined) {
+        const unknown = candidates.find(candidate => availability.get(candidate) === 'unknown')
+        if (unknown === undefined)
+          throw new Error(`REMOTE_DSH_RELEASE_UNAVAILABLE: 候选 release 均已确认不存在（${candidates.join('、')}），无法安装 DSH 内核；请改用 installRef 指定其它版本`)
+        tag = unknown
+        urls = dshZipDownloadUrls(repo, tag, zipName)
+        notes.push(`候选 release 可用性未知，回退 ${tag}`)
+      }
+    }
+    if (digest === undefined)
+      notes.push(`未取得 ${zipName} 的可信摘要，将跳过 SHA-256 校验；校验不了就不启用镜像`)
+    const dshUrls = urls
+    // 版本以实际选中的 tag 为准，避免候选跨版本时上报的版本与安装物不符。
+    const dshVersion = parseVersionFromTag(tag) ?? resolved.version
+    assertSupportedDshVersion(dshVersion)
+    return {
+      os,
+      arch,
+      matrix,
+      repo,
+      dshEntry: DSH_ZIP_ENTRY,
+      dshVersion,
+      node,
+      // 摘要缺失时脚本会跳过 SHA-256 校验：此时只留官方源，绝不额外放大可写入口。
+      dsh: { kind: 'pkg-zip', urls: digest === undefined ? dshUrls.slice(0, 1) : dshUrls, ...digest === undefined ? {} : { digest }, zipName, tag },
+      pnpm,
+      notes,
+    }
+  }
+  const packageName = matrix.dshNpmPackage ?? '@deepseek-ai/dsh'
+  if (resolved.version === '')
+    throw new Error(`cannot resolve a DSH npm version from tag "${resolved.tag}"`)
+  // 摘要缺失时脚本会跳过校验：此时只留官方 registry 的 tarball，
+  // 绝不额外放大可写入口（与 pkg-zip 分支同规则）。
+  const officialUrls = dshNpmTarballUrls(packageName, resolved.version).slice(0, 1)
+  let urls: string[] | undefined
+  let integrity: string | undefined
+  try {
+    const dist = await npmDist(packageName, resolved.version)
+    integrity = normalizeNpmIntegrity(dist.integrity)
+    urls = integrity === undefined ? officialUrls : [...new Set([dist.url, dist.mirrorUrl])]
+  }
+  catch (error) {
+    notes.push(`npm 元数据获取失败（${messageOf(error)}），回退确定性 URL`)
+  }
+  if (integrity === undefined)
+    notes.push(`未取得 ${packageName}@${resolved.version} 的可校验完整性摘要，仅使用官方下载源并跳过校验`)
+  return {
+    os,
+    arch,
+    matrix,
+    repo,
+    dshEntry: DSH_NPM_ENTRY,
+    dshVersion: resolved.version,
+    node,
+    dsh: { kind: 'npm-tgz', urls: urls ?? officialUrls, ...integrity === undefined ? {} : { integrity }, packageName, version: resolved.version },
+    pnpm,
+    notes,
+  }
+}
+
+function quoteUrls(urls: string[]): string {
+  return urls.map(shQuote).join(' ')
+}
+
+const INSTALL_SHELL_HELPERS: string[] = [
+  'fetch_one() {',
+  '  _dst="$1"; _url="$2"',
+  '  if command -v curl >/dev/null 2>&1; then',
+  '    log download "$_url"',
+  '    if curl -fsSL --retry 3 --connect-timeout 15 -o "$_dst" "$_url" 2>"$TMP/fetch.err"; then return 0; fi',
+  '    _errs="$_errs | $_url: $(head -n 1 "$TMP/fetch.err" 2>/dev/null || echo download failed)"',
+  '    return 1',
+  '  fi',
+  '  if command -v wget >/dev/null 2>&1; then',
+  '    log download "$_url"',
+  '    if wget -q --tries=3 -O "$_dst" "$_url" 2>/dev/null; then return 0; fi',
+  '    _errs="$_errs | $_url: wget download failed"',
+  '    return 1',
+  '  fi',
+  '  log failed "REMOTE_INSTALL_NO_DOWNLOADER: 远端缺少 curl 或 wget，请先安装其一"',
+  '  exit 9',
+  '}',
+  'fetch() {',
+  '  _dst="$1"; shift',
+  '  _errs=""',
+  '  for _url in "$@"; do',
+  '    if fetch_one "$_dst" "$_url"; then return 0; fi',
+  '  done',
+  '  log failed "所有下载源均失败:$_errs"',
+  '  exit 10',
+  '}',
+  'fetch_verified() {',
+  '  _dst="$1"; _want="$2"; _name="$3"; shift 3',
+  '  _errs=""',
+  '  _mismatch=0',
+  '  for _url in "$@"; do',
+  '    if fetch_one "$_dst" "$_url"; then',
+  '      if verify "$_dst" "$_want" "$_name"; then return 0; fi',
+  '      _mismatch=1',
+  '      log verify "改用下一个下载源: $_url"',
+  '    fi',
+  '  done',
+  '  if [ "$_mismatch" = 0 ]; then',
+  '    log failed "所有下载源均失败:$_errs"',
+  '    exit 10',
+  '  fi',
+  '  log failed "checksum mismatch: $_name (want sha$_algo:$_hex, got $_got)"',
+  '  exit 11',
+  '}',
+  'verify() {',
+  '  _file="$1"; _want="$2"; _name="$3"',
+  '  case "$_want" in',
+  '    sha256:*) _algo=256; _hex="$(printf \'%s\' "$_want" | sed \'s/^sha256://\')" ;;',
+  '    sha512:*) _algo=512; _hex="$(printf \'%s\' "$_want" | sed \'s/^sha512://\')" ;;',
+  '    "") log verify "警告: 未取得可信摘要，跳过校验 $_name"; return 0 ;;',
+  '    *) _algo=256; _hex="$_want" ;;',
+  '  esac',
+  '  _got=""',
+  `  if [ "\$_algo" = 256 ]; then`,
+  '    if command -v sha256sum >/dev/null 2>&1; then _got="$(sha256sum "$_file" | cut -d\' \' -f1)"',
+  '    elif command -v shasum >/dev/null 2>&1; then _got="$(shasum -a 256 "$_file" | cut -d\' \' -f1)"',
+  '    fi',
+  '  else',
+  '    if command -v sha512sum >/dev/null 2>&1; then _got="$(sha512sum "$_file" | cut -d\' \' -f1)"',
+  '    elif command -v shasum >/dev/null 2>&1; then _got="$(shasum -a 512 "$_file" | cut -d\' \' -f1)"',
+  '    fi',
+  '  fi',
+  '  if [ -z "$_got" ]; then',
+  // 跳过校验等于让镜像同时决定运行时和它的校验依据，这里必须失败而不是放行。
+  '    log failed "REMOTE_INSTALL_NO_DIGEST_TOOL: 远端缺少可用的摘要工具（sha256sum/shasum），无法校验 $_name"',
+  '    exit 14',
+  '  fi',
+  '  if [ "$_got" != "$_hex" ]; then',
+  '    log verify "校验不通过: $_name (want sha$_algo:$_hex, got $_got)"',
+  '    return 1',
+  '  fi',
+  `  log verify "$_name 校验通过 (sha$_algo)"`,
+  '}',
+  'extract_zip() {',
+  '  _zip="$1"; _dir="$2"',
+  '  mkdir -p "$_dir"',
+  '  if command -v unzip >/dev/null 2>&1; then unzip -q -o "$_zip" -d "$_dir"',
+  '  elif command -v python3 >/dev/null 2>&1; then python3 -m zipfile -e "$_zip" "$_dir"',
+  '  else',
+  '    log failed "REMOTE_INSTALL_NO_UNZIP: 远端缺少 unzip 或 python3，无法解压发行包"',
+  '    exit 12',
+  '  fi',
+  '}',
+  'flatten_move() {',
+  '  _src="$1"; _dst="$2"',
+  '  _count=0; _top=""',
+  '  for _e in "$_src"/*; do',
+  '    if [ -e "$_e" ]; then _count=$((_count + 1)); _top="$_e"; fi',
+  '  done',
+  '  rm -rf "$_dst"',
+  '  if [ "$_count" -eq 1 ] && [ -d "$_top" ]; then',
+  '    mkdir -p "$_dst"',
+  '    for _e in "$_top"/* "$_top"/.[!.]* "$_top"/..?*; do',
+  '      if [ -e "$_e" ]; then mv -f "$_e" "$_dst/"; fi',
+  '    done',
+  '    rmdir "$_top" 2>/dev/null || true',
+  '    rmdir "$_src" 2>/dev/null || true',
+  '  else',
+  '    mv -f "$_src" "$_dst"',
+  '  fi',
+  '}',
+]
+
+export function buildInstallScript(plan: RemoteInstallPlan, options: { force?: boolean, profileName?: string, remotePort?: number } = {}): string {
+  assertSupportedDshVersion(plan.dshVersion)
+  assertSupportedDshVersion(plan.dsh.kind === 'pkg-zip' ? parseVersionFromTag(plan.dsh.tag) ?? '' : plan.dsh.version)
+  const reinstallMarker = options.force === true ? ['REINSTALL=1'] : ['REINSTALL=']
+  // 强制重装要先停掉远端实例。停与装必须同属一次远端操作：分开执行，中间那一段
+  // 没有占用，别的操作（插件同步、切换核心）会插进来动同一个实例。issue #1572。
+  const stopSection = options.force === true && options.profileName !== undefined && options.remotePort !== undefined
+    ? [
+        'log install "重新安装: 停掉远端旧实例"',
+        ...remoteInstanceStopCommand(options.profileName, options.remotePort),
+      ]
+    : []
+  const dshSection = plan.dsh.kind === 'pkg-zip'
+    ? [
+        `if [ -f "$ROOT/dependencies/dsh/${DSH_ZIP_ENTRY}" ] && [ -z "$REINSTALL" ]; then`,
+        `  log install "dsh 已就绪"`,
+        `else`,
+        `  log download "dsh ${plan.dsh.tag}"`,
+        `  fetch_verified "$TMP/dsh-pkg.zip" "${plan.dsh.digest ?? ''}" "${plan.dsh.zipName}" ${quoteUrls(plan.dsh.urls)}`,
+        `  extract_zip "$TMP/dsh-pkg.zip" "$ROOT/dependencies/dsh.new"`,
+        `  flatten_move "$ROOT/dependencies/dsh.new" "$ROOT/dependencies/dsh"`,
+        `  log install "dsh 安装完成 (${plan.dsh.tag})"`,
+        `fi`,
+      ].join('\n')
+    : [
+        `install_dsh_deps() {`,
+        `  for _reg in ${quoteUrls(['https://registry.npmjs.org', 'https://registry.npmmirror.com'])}; do`,
+        `    if ( cd "$ROOT/dependencies/dsh" && "$ROOT/runtime/bin/node" "$ROOT/dependencies/pnpm/${PNPM_ENTRY}" install --prod --silent --registry="$_reg" >"$TMP/pnpm.log" 2>&1 ); then`,
+        `      log install "dsh 依赖安装完成 (registry $_reg)"`,
+        `      return 0`,
+        `    fi`,
+        `  done`,
+        `  log failed "pnpm install 失败: $(tail -n 5 "$TMP/pnpm.log" 2>/dev/null | tr '\n' ' ')"`,
+        `  return 1`,
+        `}`,
+        `if [ -f "$ROOT/dependencies/dsh/${DSH_NPM_ENTRY}" ] && [ -z "$REINSTALL" ]; then`,
+        `  log install "dsh 已就绪"`,
+        `else`,
+        `  log download "dsh ${plan.dsh.packageName}@${plan.dsh.version} (npm)"`,
+        `  fetch_verified "$TMP/dsh.tgz" "${plan.dsh.integrity ?? ''}" "${plan.dsh.packageName}-${plan.dsh.version}.tgz" ${quoteUrls(plan.dsh.urls)}`,
+        `  rm -rf "$ROOT/dependencies/dsh.new"`,
+        `  mkdir -p "$ROOT/dependencies/dsh.new"`,
+        `  tar -xzf "$TMP/dsh.tgz" -C "$ROOT/dependencies/dsh.new" --strip-components=1`,
+        `  flatten_move "$ROOT/dependencies/dsh.new" "$ROOT/dependencies/dsh"`,
+        `  install_dsh_deps || exit 13`,
+        `  log install "dsh 安装完成 (${plan.dsh.packageName}@${plan.dsh.version})"`,
+        `fi`,
+      ].join('\n')
+  return [
+    'set -eu',
+    ...reinstallMarker,
+    'ROOT="$HOME/.dsh-desktop"',
+    // bootstrap 用按运行隔离的临时目录：退出清理不能扫到版本安装的临时目录和槽位锁，
+    // 那两者可能正跑在同一台机器上。
+    'TMP="$ROOT/tmp/bootstrap.$$"',
+    'mkdir -p "$ROOT/dependencies"',
+    // 清掉上次崩溃留下的 bootstrap 临时目录（持有者进程已经不在的）。
+    'for _d in "$ROOT/tmp"/bootstrap.*; do',
+    '  [ -d "$_d" ] || continue',
+    '  _pid="$(basename "$_d" | sed \'s/^bootstrap\\.//\')"',
+    '  kill -0 "$_pid" 2>/dev/null || rm -rf "$_d"',
+    'done',
+    'mkdir -p "$TMP"',
+    // 占用声明的路径在拿到声明之前是空的：退出清理按它判断自己有没有占住槽位。
+    'CLAIM=""',
+    // 没拿到占用声明就退出时，不能删固定名字的暂存目录：那是拿到声明的那一次安装正在写的。
+    'cleanup() { rm -rf "$TMP"; if [ -f "$CLAIM" ]; then rm -rf "$ROOT/runtime.new" "$ROOT/dependencies/pnpm.new" "$ROOT/dependencies/dsh.new"; fi; rm -f "$CLAIM"; }',
+    'trap cleanup EXIT',
+    `log() { printf '${BOOTSTRAP_LOG_PREFIX}%s %s\\n' "$1" "$2"; }`,
+    ...INSTALL_SHELL_HELPERS,
+    // 活动槽位的占用声明：装的就是活动槽位，与切换核心、插件同步共用这一把锁。
+    ...remoteSlotClaimShell('dsh', { busyText: '远端实例正被其它操作改动（切换核心、强制重装或插件同步）' }),
+    ...stopSection,
+    'if [ -x "$ROOT/runtime/bin/node" ]; then',
+    '  log install "node 已就绪: $("$ROOT/runtime/bin/node" --version 2>/dev/null || echo installed)"',
+    'else',
+    `  log download "node ${plan.node.version}"`,
+    `  fetch_verified "$TMP/SHASUMS256.txt" "sha256:${plan.node.shasumSha256}" "SHASUMS256.txt" ${quoteUrls(plan.node.shasumUrls)}`,
+    `  _want="$(grep " ${plan.node.filename}\$" "$TMP/SHASUMS256.txt" | head -n 1 | tr -d '\\r' | sed 's/^ *//' | cut -d' ' -f1)"`,
+    `  fetch_verified "$TMP/node.tar.gz" "\$_want" "${plan.node.filename}" ${quoteUrls(plan.node.urls)}`,
+    '  rm -rf "$ROOT/runtime.new"',
+    '  mkdir -p "$ROOT/runtime.new"',
+    '  tar -xzf "$TMP/node.tar.gz" -C "$ROOT/runtime.new" --strip-components=1',
+    '  flatten_move "$ROOT/runtime.new" "$ROOT/runtime"',
+    `  log install "node 安装完成: $("$ROOT/runtime/bin/node" --version 2>/dev/null || echo ok)"`,
+    'fi',
+    `if [ -f "$ROOT/dependencies/pnpm/${PNPM_ENTRY}" ]; then`,
+    '  log install "pnpm 已就绪"',
+    'else',
+    `  log download "pnpm ${plan.pnpm.version}"`,
+    `  fetch_verified "$TMP/pnpm.tgz" "sha256:${plan.pnpm.sha256}" "pnpm-${plan.pnpm.version}.tgz" ${quoteUrls(plan.pnpm.urls)}`,
+    '  rm -rf "$ROOT/dependencies/pnpm.new"',
+    '  mkdir -p "$ROOT/dependencies/pnpm.new"',
+    '  tar -xzf "$TMP/pnpm.tgz" -C "$ROOT/dependencies/pnpm.new" --strip-components=1',
+    '  flatten_move "$ROOT/dependencies/pnpm.new" "$ROOT/dependencies/pnpm"',
+    `  log install "pnpm 安装完成: ${plan.pnpm.version}"`,
+    'fi',
+    dshSection,
+    'log install "远端初始化完成"',
+  ].join('\n')
+}
+
+export async function planRemoteVersionInstall(
+  unameOut: string,
+  config: Pick<Config, 'installRepo'>,
+  tag: string,
+  fetchers: {
+    listAssets?: (repo: string, tag: string) => Promise<Array<{ name: string, url: string, digest?: string }>>
+    npmDist?: (packageName: string, version: string) => Promise<{ url: string, mirrorUrl: string, integrity?: string }>
+    probe?: (url: string) => Promise<ReleaseAvailability>
+  } = {},
+): Promise<DshVersionInstallPlan> {
+  const { os, arch } = parsePlatform(unameOut)
+  const matrix = assetMatrixFor(os, arch)
+  const repo = pkgRepoOf(config.installRepo)
+  const listAssets = fetchers.listAssets ?? listGithubAssets
+  const npmDist = fetchers.npmDist ?? npmDistMetadata
+  const probe = fetchers.probe ?? probeReleaseDownload
+  const notes: string[] = []
+  const version = parseVersionFromTag(tag) ?? ''
+  if (version === '')
+    throw new Error(`REMOTE_CORE_TAG_INVALID: 无法从版本标识 ${tag} 解析版本号`)
+  assertSupportedDshVersion(version)
+  if (matrix.dshKind === 'pkg-zip') {
+    const zipName = matrix.dshZipName ?? ''
+    let urls: string[] | undefined
+    let digest: string | undefined
+    try {
+      const assets = await listAssets(repo, tag)
+      const asset = assets.find(item => item.name === zipName)
+      if (asset !== undefined) {
+        urls = [asset.url, ...dshZipDownloadUrls(repo, tag, zipName).slice(1)]
+        digest = asset.digest
+      }
+      else {
+        notes.push(`release ${tag} 没有 ${zipName}`)
+      }
+    }
+    catch (error) {
+      notes.push(`release 资产元数据获取失败（${tag}: ${messageOf(error)}）`)
+    }
+    if (urls === undefined) {
+      const candidateUrls = dshZipDownloadUrls(repo, tag, zipName)
+      const state = await probe(candidateUrls[0] ?? '')
+      if (state === 'missing')
+        throw new Error(`REMOTE_DSH_RELEASE_UNAVAILABLE: release ${tag} 没有 ${zipName}，无法安装该版本`)
+      urls = candidateUrls
+      notes.push(`release ${tag} 可用性未知（${state}），继续尝试下载`)
+    }
+    if (digest === undefined)
+      notes.push(`未取得 ${zipName} 的可信摘要，仅使用官方下载源并跳过 SHA-256 校验`)
+    const downloadUrls = digest === undefined ? urls.slice(0, 1) : urls
+    return {
+      os,
+      arch,
+      repo,
+      tag,
+      version,
+      dshEntry: DSH_ZIP_ENTRY,
+      dsh: { kind: 'pkg-zip', urls: downloadUrls, ...digest === undefined ? {} : { digest }, zipName, tag },
+      notes,
+    }
+  }
+  const packageName = matrix.dshNpmPackage ?? '@deepseek-ai/dsh'
+  // 摘要缺失时脚本会跳过校验：此时只留官方 registry 的 tarball，
+  // 否则镜像文件会绕过校验直接被解包安装（与 pkg-zip 分支同规则）。
+  const officialUrls = dshNpmTarballUrls(packageName, version).slice(0, 1)
+  let urls: string[] | undefined
+  let integrity: string | undefined
+  try {
+    const dist = await npmDist(packageName, version)
+    integrity = normalizeNpmIntegrity(dist.integrity)
+    urls = integrity === undefined ? officialUrls : [...new Set([dist.url, dist.mirrorUrl])]
+  }
+  catch (error) {
+    notes.push(`npm 元数据获取失败（${packageName}@${version}: ${messageOf(error)}）`)
+  }
+  if (urls === undefined)
+    urls = officialUrls
+  if (integrity === undefined)
+    notes.push(`未取得 ${packageName}@${version} 的可校验完整性摘要，仅使用官方下载源并跳过校验`)
+  return {
+    os,
+    arch,
+    repo,
+    tag,
+    version,
+    dshEntry: DSH_NPM_ENTRY,
+    dsh: { kind: 'npm-tgz', urls, ...integrity === undefined ? {} : { integrity }, packageName, version },
+    notes,
+  }
+}
+
+export function buildCoreVersionInstallScript(plan: DshVersionInstallPlan, options: { slot: string, force?: boolean }): string {
+  assertSupportedDshVersion(plan.version)
+  if (!/^[\w.-]+$/u.test(options.slot))
+    throw new Error(`REMOTE_CORE_SLOT_INVALID: 非法版本目录名 ${options.slot}`)
+  const reinstallMarker = options.force === true ? ['REINSTALL=1'] : ['REINSTALL=']
+  const slot = `$ROOT/dependencies/${options.slot}`
+  const dshSection = plan.dsh.kind === 'pkg-zip'
+    ? [
+        `  log download "dsh ${plan.dsh.tag}"`,
+        `  fetch_verified "$TMP/dsh-pkg.zip" "${plan.dsh.digest ?? ''}" "${plan.dsh.zipName}" ${quoteUrls(plan.dsh.urls)}`,
+        '  rm -rf "$STAGE"',
+        '  mkdir -p "$STAGE"',
+        '  extract_zip "$TMP/dsh-pkg.zip" "$STAGE"',
+      ].join('\n')
+    : [
+        `  log download "dsh ${plan.dsh.packageName}@${plan.dsh.version} (npm)"`,
+        `  fetch_verified "$TMP/dsh.tgz" "${plan.dsh.integrity ?? ''}" "${plan.dsh.packageName}-${plan.dsh.version}.tgz" ${quoteUrls(plan.dsh.urls)}`,
+        '  rm -rf "$STAGE"',
+        '  mkdir -p "$STAGE"',
+        '  tar -xzf "$TMP/dsh.tgz" -C "$STAGE" --strip-components=1',
+      ].join('\n')
+  return [
+    'set -eu',
+    ...reinstallMarker,
+    'ROOT="$HOME/.dsh-desktop"',
+    'TMP="$ROOT/tmp/ver.$$"',
+    `SLOT="${slot}"`,
+    // 暂存与就绪目录按运行隔离：同一槽位的旧脚本仍在远端运行时，
+    // 它的退出清理不能删掉新一次安装写入的文件。
+    'STAGE="$SLOT.new.$$"',
+    'READY="$SLOT.ready.$$"',
+    'mkdir -p "$ROOT/dependencies" "$TMP"',
+    `log() { printf '${BOOTSTRAP_LOG_PREFIX}%s %s\\n' "$1" "$2"; }`,
+    // 拿锁：原子发布持有者，后到的安装直接失败而不是和旧脚本互相覆盖。
+    ...remoteSlotClaimShell(options.slot),
+    // 退出清理只删自己的声明与暂存目录。
+    'cleanup() { rm -rf "$TMP" "$STAGE" "$READY"; rm -f "$CLAIM"; }',
+    // 锁到手后才挂退出清理：拿锁失败时不能把别人的锁删掉。
+    'trap cleanup EXIT',
+    ...INSTALL_SHELL_HELPERS,
+    'if [ ! -x "$ROOT/runtime/bin/node" ]; then',
+    '  log failed "REMOTE_CORE_TARGET_NOT_READY: 远端缺少 node 运行时，请先完成远端初始化"',
+    '  exit 15',
+    'fi',
+    ...(plan.dsh.kind === 'pkg-zip'
+      ? []
+      : [
+          `if [ ! -f "$ROOT/dependencies/pnpm/${PNPM_ENTRY}" ]; then`,
+          '  log failed "REMOTE_CORE_TARGET_NOT_READY: 远端缺少 pnpm，请先完成远端初始化"',
+          '  exit 15',
+          'fi',
+        ]),
+    // 发行包自带依赖，装完即可用；只有 npm 包才需要再装依赖。
+    ...(plan.dsh.kind === 'pkg-zip'
+      ? []
+      : [
+          'install_dsh_deps() {',
+          '  _dir="$1"',
+          `  for _reg in ${quoteUrls(['https://registry.npmjs.org', 'https://registry.npmmirror.com'])}; do`,
+          `    if ( cd "$_dir" && "$ROOT/runtime/bin/node" "$ROOT/dependencies/pnpm/${PNPM_ENTRY}" install --prod --silent --registry="$_reg" >"$TMP/pnpm.log" 2>&1 ); then`,
+          '      log install "dsh 依赖安装完成 (registry $_reg)"',
+          '      return 0',
+          '    fi',
+          '  done',
+          `  log failed "pnpm install 失败: $(tail -n 5 "$TMP/pnpm.log" 2>/dev/null | tr '\n' ' ')"`,
+          '  return 1',
+          '}',
+        ]),
+    `if [ -f "$SLOT/${plan.dshEntry}" ] && [ -z "$REINSTALL" ]; then`,
+    `  log install "dsh 已就绪 (${plan.tag})"`,
+    'else',
+    dshSection,
+    ...(plan.dsh.kind === 'pkg-zip' ? [] : ['  install_dsh_deps "$STAGE" || { rm -rf "$STAGE"; exit 13; }']),
+    '  rm -rf "$READY"',
+    '  flatten_move "$STAGE" "$READY"',
+    // 发布：把旧槽位换走，再把就绪目录 rename 上去。
+    // 直接 rm 再 mv 时，新旧脚本交错会把就绪目录移进已有槽位，而不是替换它。
+    '  if [ -e "$SLOT" ]; then',
+    '    mv "$SLOT" "$TMP/replaced"',
+    '  fi',
+    '  mv "$READY" "$SLOT"',
+    `  log install "dsh 安装完成 (${plan.tag})"`,
+    'fi',
+  ].join('\n')
+}
+
+export function checkMissingCommand(): string {
+  return [
+    `ROOT="$HOME/${REMOTE_ROOT}"`,
+    `[ -x "$ROOT/runtime/bin/node" ] || echo node`,
+    `[ -f "$ROOT/dependencies/pnpm/${PNPM_ENTRY}" ] || echo pnpm`,
+    `if [ ! -f "$ROOT/dependencies/dsh/${DSH_ZIP_ENTRY}" ] && [ ! -f "$ROOT/dependencies/dsh/${DSH_NPM_ENTRY}" ]; then echo dsh; fi`,
+    'true',
+  ].join('\n')
+}
+
+export async function assertRemoteDshVersion(session: RemoteSession, allowMissing = false): Promise<void> {
+  const remote = await readRemoteDshPackage(session)
+  if (allowMissing && remote.kind === 'missing')
+    return
+  if (remote.kind === 'unreadable')
+    throw new Error(remote.error)
+  assertSupportedDshVersion(remote.kind === 'installed' ? remote.version : '')
+}
+
+export async function readRemoteDshVersion(session: RemoteSession): Promise<string | undefined> {
+  const remote = await readRemoteDshPackage(session)
+  if (remote.kind === 'unreadable')
+    throw new Error(remote.error)
+  return remote.kind === 'installed' ? remote.version : undefined
+}
+
+export type RemoteDshPackageState
+  = | { kind: 'missing' }
+    | { kind: 'installed', version: string }
+    | { kind: 'unreadable', error: string }
+
+export async function readRemoteDshPackage(session: RemoteSession): Promise<RemoteDshPackageState> {
+  const result = await session.exec([
+    `ROOT="$HOME/${REMOTE_ROOT}"`,
+    `if [ -f "$ROOT/dependencies/dsh/${DSH_ZIP_ENTRY}" ]; then REMOTE_DSH_PACKAGE="$ROOT/dependencies/dsh/node_modules/@deepseek-ai/dsh/package.json"`,
+    `elif [ -f "$ROOT/dependencies/dsh/${DSH_NPM_ENTRY}" ]; then REMOTE_DSH_PACKAGE="$ROOT/dependencies/dsh/package.json"`,
+    'else echo REMOTE_DSH_MISSING; exit 0; fi',
+    'cat "$REMOTE_DSH_PACKAGE"',
+  ].join('\n'))
+  if (result.code === 0 && result.stdout.trim() === 'REMOTE_DSH_MISSING')
+    return { kind: 'missing' }
+  if (result.code !== 0)
+    return { kind: 'unreadable', error: `REMOTE_DSH_PACKAGE_UNREADABLE: ${describeExecFailure(result.code, result.stderr)}` }
+  try {
+    const pkg: unknown = JSON.parse(result.stdout)
+    if (typeof pkg === 'object' && pkg !== null && 'version' in pkg && typeof pkg.version === 'string' && pkg.version !== '')
+      return { kind: 'installed', version: pkg.version }
+  }
+  catch (error) {
+    return { kind: 'unreadable', error: `REMOTE_DSH_PACKAGE_INVALID: ${messageOf(error)}` }
+  }
+  return { kind: 'unreadable', error: 'REMOTE_DSH_PACKAGE_INVALID: 远端 dsh 包元数据缺少有效 version' }
+}
+
+export function missingComponentsOf(stdout: string): string[] {
+  return stdout.split('\n').map(line => line.trim()).filter(line => line !== '' && ['node', 'dsh', 'pnpm'].includes(line))
+}
+
+export function layoutDshEntry(plan?: RemoteInstallPlan): string {
+  return `$HOME/${REMOTE_ROOT}/dependencies/dsh/${plan?.dshEntry ?? DSH_ZIP_ENTRY}`
+}
+
+export function layoutNodeBinary(): string {
+  return `"$HOME/${REMOTE_ROOT}/runtime/bin/node"`
+}
+
+export function layoutBinDir(): string {
+  return `$HOME/${REMOTE_ROOT}/runtime/bin`
+}
+
+export function ensurePnpmCommand(): string {
+  const shim = `#!/bin/sh\nexec "$HOME/${REMOTE_ROOT}/runtime/bin/node" "$HOME/${REMOTE_ROOT}/dependencies/pnpm/${PNPM_ENTRY}" "$@"\n`
+  return `B="${layoutBinDir()}"; [ -x "$B/pnpm" ] || { mkdir -p "$B" && printf %s ${shQuote(shim)} > "$B/pnpm" && chmod +x "$B/pnpm"; }`
+}
+
+export function dshEntryProbeCommand(): string {
+  return [
+    `ROOT="$HOME/${REMOTE_ROOT}"`,
+    `if [ -f "$ROOT/dependencies/dsh/${DSH_ZIP_ENTRY}" ]; then printf '%s\\n' "$ROOT/dependencies/dsh/${DSH_ZIP_ENTRY}"`,
+    `elif [ -f "$ROOT/dependencies/dsh/${DSH_NPM_ENTRY}" ]; then printf '%s\\n' "$ROOT/dependencies/dsh/${DSH_NPM_ENTRY}"`,
+    'fi',
+    'true',
+  ].join('\n')
+}
+
+/**
+ * 取远端实例的启动令牌。
+ *
+ * 令牌属于实例，不属于机器：整机一份日志里取最后一行，拿到的是最后启动的那个实例的令牌。
+ * 现在每个实例写自己那份日志（旧版桌面起的实例仍写整机日志，按端口过滤回退），
+ * 取到的令牌就一定是这个端口上的实例的。issue #1573。
+ */
+export function remoteWebTokenCommand(port: number): string {
+  return [
+    `LOG="$HOME/${remoteWebLog(port)}"`,
+    `LEGACY="$HOME/${LEGACY_REMOTE_WEB_LOG}"`,
+    'TOKEN=""',
+    'if [ -f "$LOG" ]; then TOKEN="$(grep -oE \'token=[A-Za-z0-9._~-]+\' "$LOG" 2>/dev/null | tail -n 1 | cut -d= -f2)"; fi',
+    `if [ -z "$TOKEN" ] && [ -f "$LEGACY" ]; then TOKEN="$(grep -E ":${port}[/?]" "$LEGACY" 2>/dev/null | grep -oE 'token=[A-Za-z0-9._~-]+' | tail -n 1 | cut -d= -f2)"; fi`,
+    'if [ -z "$TOKEN" ] && [ -f "$LEGACY" ]; then COUNT="$(grep -c -oE \'token=[A-Za-z0-9._~-]+\' "$LEGACY" 2>/dev/null || true)"; if [ "$COUNT" = "1" ]; then TOKEN="$(grep -oE \'token=[A-Za-z0-9._~-]+\' "$LEGACY" 2>/dev/null | tail -n 1 | cut -d= -f2)"; fi; fi',
+    'printf \'%s\' "$TOKEN"',
+  ].join('\n')
+}
+
+export function safeProfileName(raw: string | undefined): string {
+  return raw !== undefined && /^[\w-]+$/.test(raw) ? raw : DEFAULT_REMOTE_PROFILE
+}
+
+export function startCommandFor(profile: MachineProfile, plan?: RemoteInstallPlan): string {
+  if (plan !== undefined)
+    assertSupportedDshVersion(plan.dshVersion)
+  if (profile.startCommand !== undefined)
+    return `mkdir -p "$HOME/.dsh" && ( ${profile.startCommand} >>"$HOME/${remoteWebLog(profile.remotePort)}" 2>&1 < /dev/null & ) &`
+  const node = `$HOME/${REMOTE_ROOT}/runtime/bin/node`
+  const dshBin = layoutDshEntry(plan)
+  const profileName = safeProfileName(profile.profileName)
+  return [
+    `ROOT="$HOME/${REMOTE_ROOT}"`,
+    `NODE=${node}`,
+    `DSH_BIN=${dshBin}`,
+    `LOG_DIR="$HOME/.dsh"`,
+    `LOG="$LOG_DIR/dsh-remote-web-${profile.remotePort}.log"`,
+    `if [ ! -x "$NODE" ] || [ ! -f "$DSH_BIN" ]; then echo "REMOTE_NOT_INSTALLED: 远端三件套未安装完整"; exit 1; fi`,
+    `mkdir -p "$LOG_DIR"`,
+    `export PATH="$ROOT/runtime/bin:$PATH"`,
+    // 远端核心要与本机桌面侧用同一套 TLS 信任库：Node 默认只信自带的 CA 列表，
+    // 远端若经 TLS 中间人的代理出网（代理地址取远端自己的环境），证书校验会失败
+    // （UNABLE_TO_VERIFY_LEAF_SIGNATURE）。先用远端自己的 node 试一次开关：不认就
+    // 跳过，不能让一个不认的 flag 把远端核心带崩。
+    `if "$NODE" --use-system-ca -e 0 2>/dev/null; then export NODE_OPTIONS="\${NODE_OPTIONS:-} --use-system-ca"; fi`,
+    `export DSH_TELEMETRY_DISABLED=1 NO_COLOR=1 DSH_WEB_PORT=${profile.remotePort}`,
+    `export DSH_REMOTE_SESSION_ORIGIN=${shQuote(profile.name)}`,
+    `( sh -c 'echo $$ > "$1"; exec "$2" "$3" --profile "$5" --host 127.0.0.1 --port "$4" --no-open' dsh-remote "$HOME/${remotePidfile(profile.remotePort)}" "$NODE" "$DSH_BIN" ${profile.remotePort} ${profileName} </dev/null >>"$LOG" 2>&1 & )`,
+    `echo "远端实例已拉起（档案: ${profileName}, 日志: $LOG）"`,
+  ].join('\n')
+}
+
+export function readEnvCredentials(path: string): EnvCredentials {
+  let text: string
+  try {
+    text = readFileSync(path, 'utf8')
+  }
+  catch {
+    return {}
+  }
+  const out: EnvCredentials = {}
+  const apiKey = envValueOf(text, 'DEEPSEEK_API_KEY')
+  /* v8 ignore next -- attribution artifact: both arms are exercised by the credentials tests */
+  if (apiKey !== undefined)
+    out.apiKey = apiKey
+  const baseUrl = envValueOf(text, 'DEEPSEEK_BASE_URL')
+  if (baseUrl !== undefined)
+    out.baseUrl = baseUrl
+  return out
+}
+
+export function credentialsCopyCommand(credentials: EnvCredentials & { apiKey: string }): string {
+  const managed = ['DEEPSEEK_API_KEY', ...(credentials.baseUrl === undefined ? [] : ['DEEPSEEK_BASE_URL'])]
+  const writes = [`printf 'DEEPSEEK_API_KEY=%s\\n' ${shQuote(credentials.apiKey)}`]
+  if (credentials.baseUrl !== undefined)
+    writes.push(`printf 'DEEPSEEK_BASE_URL=%s\\n' ${shQuote(credentials.baseUrl)}`)
+  const filter = managed.map(key => `^${key}=`).join('|')
+  return [
+    `mkdir -p "$HOME/.dsh"`,
+    `if grep -q '^DEEPSEEK_API_KEY=' "$HOME/.dsh/.env" 2>/dev/null; then echo existing; else umask 077 && { grep -v -E '${filter}' "$HOME/.dsh/.env" 2>/dev/null || true; ${writes.join('; ')}; } > "$HOME/.dsh/.env.new" && mv -f "$HOME/.dsh/.env.new" "$HOME/.dsh/.env" && echo copied; fi`,
+  ].join(' && ')
+}
+
+function envValueOf(text: string, key: string): string | undefined {
+  for (const line of text.split('\n')) {
+    if (!line.startsWith(`${key}=`))
+      continue
+    const value = line.slice(key.length + 1).trim().replace(/^"(.*)"$/u, '$1')
+    return value === '' ? undefined : value
+  }
+  return undefined
+}
+
+export function firstLineOf(stdout: string): string {
+  for (const line of stdout.split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed !== '')
+      return trimmed
+  }
+  return ''
+}
+
+export const REMOTE_PROBE_NO_DOWNLOADER = 'REMOTE_PROBE_NO_DOWNLOADER'
+
+function withDownloaderFallback(curlArm: string, wgetArm: string): string {
+  return [
+    `if [ -n "$(command -v curl)" ]; then ${curlArm}`,
+    `elif [ -n "$(command -v wget)" ]; then ${wgetArm}`,
+    `else echo "${REMOTE_PROBE_NO_DOWNLOADER}: 远端缺少 curl 与 wget，无法探测就绪状态" >&2; exit 1; fi`,
+  ].join('; ')
+}
+
+export function rootProbeCommand(remotePort: number, timeoutMs: number): string {
+  const seconds = Math.max(1, Math.ceil(timeoutMs / 1000))
+  return withDownloaderFallback(
+    `curl -s -m ${seconds} http://127.0.0.1:${remotePort}/`,
+    `wget -q -T ${seconds} -O - http://127.0.0.1:${remotePort}/; case $? in 0|6|8) ;; *) exit 1 ;; esac`,
+  )
+}
+
+export function bundleProbeCommand(url: string, timeoutMs: number): string {
+  const seconds = Math.max(1, Math.ceil(timeoutMs / 1000))
+  return withDownloaderFallback(
+    `curl -s -m ${seconds} -w '\\n%{http_code}' ${shQuote(url)}`,
+    `wget -q -T ${seconds} -O - ${shQuote(url)} && printf '\\n200\\n' || printf '\\n0\\n'`,
+  )
+}
+
+export function splitBundleProbeStdout(stdout: string): { body: string, status: number } {
+  const trimmed = stdout.replace(/\n$/u, '')
+  const index = trimmed.lastIndexOf('\n')
+  if (index < 0) {
+    const status = Number.parseInt(trimmed, 10)
+    return Number.isNaN(status) ? { body: trimmed, status: 0 } : { body: '', status }
+  }
+  const status = Number.parseInt(trimmed.slice(index + 1).trim(), 10)
+  return Number.isNaN(status) ? { body: trimmed, status: 0 } : { body: trimmed.slice(0, index), status }
+}
+
+export function logTailCommand(port: number): string {
+  return [
+    `LOG="$HOME/${remoteWebLog(port)}"`,
+    `LEGACY="$HOME/${LEGACY_REMOTE_WEB_LOG}"`,
+    'if [ -f "$LOG" ]; then tail -n 20 "$LOG"; elif [ -f "$LEGACY" ]; then tail -n 20 "$LEGACY"; fi',
+  ].join('\n')
+}
+
+export function describeExecFailure(code: number | null, stderr: string): string {
+  const tail = stderr.trim().split('\n').slice(-3).join(' | ')
+  return `exit ${code ?? '?'}${tail === '' ? '' : `: ${tail}`}`
+}
+
+async function assertListenerDshVersion(session: RemoteSession, port: number): Promise<void> {
+  const unverifiable = (reason: string): never => {
+    throw new Error(`REMOTE_DSH_VERSION_UNVERIFIABLE: 无法确认端口 ${port} 的 DSH 版本（${reason}）；需要可识别的 Node DSH 入口及只读进程权限`)
+  }
+  const command = listenerSnapshotCommand(port)
+  const snapshot = await session.exec(command)
+  if (snapshot.code !== 0)
+    return unverifiable(snapshot.stderr.trim() || 'listener identity unavailable')
+  const identity = parseListenerSnapshot(snapshot.stdout)
+  if (identity === undefined)
+    return unverifiable('invalid listener identity')
+  const { cwd, argv } = identity
+  const entry = argv[1]
+  if (!/(?:^|\/)node(?:js)?$/u.test(argv[0] ?? '') || entry === undefined || entry === '' || entry.startsWith('-'))
+    return unverifiable('unknown DSH command entry')
+  const metadata = await session.exec([
+    `cd ${shQuote(cwd)} || exit 1`,
+    `REMOTE_DSH_LISTENER_ENTRY=${shQuote(entry)}`,
+    'case "$REMOTE_DSH_LISTENER_ENTRY" in /*) ;; *) REMOTE_DSH_LISTENER_ENTRY="$PWD/$REMOTE_DSH_LISTENER_ENTRY" ;; esac',
+    'COUNT=0',
+    'while [ -L "$REMOTE_DSH_LISTENER_ENTRY" ]; do',
+    '  [ "$COUNT" -lt 16 ] || exit 1; COUNT=$((COUNT + 1))',
+    '  LINK=$(readlink "$REMOTE_DSH_LISTENER_ENTRY") || exit 1',
+    '  case "$LINK" in /*) REMOTE_DSH_LISTENER_ENTRY=$LINK ;; *) REMOTE_DSH_LISTENER_ENTRY="$(dirname "$REMOTE_DSH_LISTENER_ENTRY")/$LINK" ;; esac',
+    'done',
+    '[ -f "$REMOTE_DSH_LISTENER_ENTRY" ] || exit 1',
+    'DIR=$(CDPATH= cd -P "$(dirname "$REMOTE_DSH_LISTENER_ENTRY")" && pwd) || exit 1',
+    'REMOTE_DSH_LISTENER_ENTRY="$DIR/$(basename "$REMOTE_DSH_LISTENER_ENTRY")"',
+    'case "$REMOTE_DSH_LISTENER_ENTRY" in */lib/bin.js) ;; *) exit 1 ;; esac',
+    `REMOTE_DSH_LISTENER_PACKAGE="\${REMOTE_DSH_LISTENER_ENTRY%/lib/bin.js}/package.json"`,
+    'cat "$REMOTE_DSH_LISTENER_PACKAGE"',
+  ].join('\n'))
+  if (metadata.code !== 0)
+    return unverifiable('listener package unreadable')
+  let pkg: unknown
+  try {
+    pkg = JSON.parse(metadata.stdout)
+  }
+  catch {
+    return unverifiable('invalid listener package')
+  }
+  if (typeof pkg !== 'object' || pkg === null || !('name' in pkg) || pkg.name !== '@deepseek-ai/dsh' || !('version' in pkg) || typeof pkg.version !== 'string')
+    return unverifiable('listener is not an identifiable DSH package')
+  assertSupportedDshVersion(pkg.version)
+  const confirmed = await session.exec(command)
+  if (confirmed.code !== 0 || confirmed.stdout !== snapshot.stdout)
+    unverifiable('listener changed during version check')
+}
+
+export async function ensureRemoteInstance(
+  session: RemoteSession,
+  profile: MachineProfile,
+  config: Config,
+  hooks: BootstrapHooks = {},
+): Promise<string> {
+  const { onEvent, onProgress } = hooks
+  const target = `${profile.host}:${profile.remotePort}`
+  try {
+    const readyFromHtml = await judgeReadiness(session, profile, config)
+    if (readyFromHtml !== undefined) {
+      emitReady(onEvent, target, readyFromHtml)
+      return target
+    }
+  }
+  catch (error) {
+    return failBootstrap(onEvent, messageOf(error))
+  }
+  let plan: RemoteInstallPlan | undefined
+  let skipSummary = ''
+  if (profile.startCommand === undefined) {
+    try {
+      await assertRemoteDshVersion(session, true)
+    }
+    catch (error) {
+      return failBootstrap(onEvent, messageOf(error))
+    }
+    onEvent?.('probe', '探测远端平台 (uname -srm)')
+    const uname = await session.exec('uname -srm')
+    if (uname.code !== 0)
+      return failBootstrap(onEvent, `无法探测远端平台: ${describeExecFailure(uname.code, uname.stderr)}`)
+    try {
+      plan = await planRemoteInstall(uname.stdout, config)
+    }
+    catch (error) {
+      return failBootstrap(onEvent, messageOf(error))
+    }
+    onEvent?.('probe', `远端平台 ${plan.os}/${plan.arch}，安装源 ${plan.repo}${plan.dsh.kind === 'pkg-zip' ? ` tag ${plan.dsh.tag}` : ` npm ${plan.dsh.version}`}`)
+    for (const note of plan.notes)
+      onEvent?.('probe', note)
+    const missing = missingComponentsOf((await session.exec(checkMissingCommand())).stdout)
+    let skips: string[] = []
+    if (missing.length > 0) {
+      onEvent?.('probe', `缺失组件: ${missing.join(', ')}`)
+      skips = await runInstallScript(session, plan, config.installTimeoutMs!, hooks)
+    }
+    else {
+      onEvent?.('probe', '三件套已就绪，跳过安装')
+    }
+    try {
+      await assertRemoteDshVersion(session)
+    }
+    catch (error) {
+      return failBootstrap(onEvent, messageOf(error))
+    }
+    skipSummary = skippedVerificationSummary(plan.notes, skips)
+  }
+  onProgress?.({ phase: 'starting' })
+  onEvent?.('launch', `拉起远端实例 (端口 ${profile.remotePort})`)
+  const started = await session.exec(startCommandFor(profile, plan))
+  if (started.code !== 0) {
+    const message = started.stdout.includes('REMOTE_NOT_INSTALLED')
+      ? `remote runtime incomplete on "${profile.host}" (REMOTE_NOT_INSTALLED)`
+      : `remote instance start failed on "${profile.host}": ${describeExecFailure(started.code, started.stderr)}`
+    return failBootstrap(onEvent, message)
+  }
+  for (let attempt = 0; attempt < config.healthPollAttempts; attempt++) {
+    onProgress?.({ phase: 'probing', attempt: attempt + 1, total: config.healthPollAttempts })
+    await sleep(config.healthPollIntervalMs)
+    let verdict: string | undefined
+    try {
+      verdict = await judgeReadiness(session, profile, config)
+    }
+    catch (error) {
+      return failBootstrap(onEvent, messageOf(error))
+    }
+    if (verdict !== undefined) {
+      emitReady(onEvent, target, verdict, skipSummary)
+      return target
+    }
+  }
+  const tail = await logTail(session, profile.remotePort)
+  return failBootstrap(
+    onEvent,
+    `remote dsh web did not become ready on "${target}" within ${config.healthPollAttempts} polls; `
+    + `fallback probe: root ${await rootResponseVerdict(session, profile, config)}; `
+    + `remote log tail: ${tail}`,
+  )
+}
+
+async function judgeReadiness(session: RemoteSession, profile: MachineProfile, config: Config): Promise<string | undefined> {
+  const verdict = await probeReadiness(session, profile, config)
+  if (verdict === undefined)
+    return undefined
+  // 端口上跑的是不是自己以为的那个档案：认得出且不是它就报错，不再静默复用别人的实例。
+  await assertListenerProfile(session, profile.remotePort, safeProfileName(profile.profileName))
+  return verdict
+}
+
+async function probeReadiness(session: RemoteSession, profile: MachineProfile, config: Config): Promise<string | undefined> {
+  const root = await session.exec(rootProbeCommand(profile.remotePort, config.healthCheckTimeoutMs))
+  if (root.code !== 0)
+    return undefined
+  const release = releaseVersionFromBootHtml(root.stdout)
+  if (release !== undefined)
+    assertSupportedDshVersion(release)
+  const urls = clientUrlsFromBootHtml(profile.remotePort, root.stdout)
+  if (urls === undefined) {
+    const status = await session.exec(rootStatusProbeCommand(profile.remotePort, config.healthCheckTimeoutMs))
+    if (status.code !== 0 || status.stdout.trim() !== '401')
+      return undefined
+    await assertListenerDshVersion(session, profile.remotePort)
+    return 'auth required (HTTP 401)'
+  }
+  if (release === undefined)
+    await assertListenerDshVersion(session, profile.remotePort)
+  const first = urls[0]
+  if (first === undefined)
+    return undefined
+  const probe = await session.exec(bundleProbeCommand(first, config.healthCheckTimeoutMs))
+  const { body, status } = splitBundleProbeStdout(probe.stdout)
+  if (probe.code === 0 && status >= 200 && status < 300 && looksLikePluginBundle(true, body))
+    return `boot manifest (${urls.length} bundles)`
+  return undefined
+}
+
+export function rootStatusProbeCommand(remotePort: number, timeoutMs: number): string {
+  const seconds = Math.max(1, Math.ceil(timeoutMs / 1000))
+  return [
+    `if [ -n "$(command -v curl)" ]; then curl -s -o /dev/null -m ${seconds} -w '%{http_code}' http://127.0.0.1:${remotePort}/`,
+    `elif [ -n "$(command -v wget)" ]; then wget -S -T ${seconds} -O /dev/null http://127.0.0.1:${remotePort}/ 2>&1 | { status=; while read -r protocol code rest; do case "$protocol" in HTTP/*) status=$code ;; esac; done; [ -n "$status" ] && printf '%s\\n' "$status"; }`,
+    `else echo ${REMOTE_PROBE_NO_DOWNLOADER}; fi`,
+  ].join('; ')
+}
+
+async function rootResponseVerdict(session: RemoteSession, profile: MachineProfile, config: Config): Promise<string> {
+  const probe = await session.exec(rootStatusProbeCommand(profile.remotePort, config.healthCheckTimeoutMs))
+  if (probe.stdout.includes(REMOTE_PROBE_NO_DOWNLOADER))
+    return `no downloader (${REMOTE_PROBE_NO_DOWNLOADER}: 远端缺少 curl 与 wget，无法探测就绪状态)`
+  return probe.code === 0 ? `root answered ${probe.stdout.trim() || '?'}` : 'no answer'
+}
+
+export async function runInstallScript(
+  session: RemoteSession,
+  plan: RemoteInstallPlan,
+  installTimeoutMs: number,
+  hooks: BootstrapHooks,
+  options: { failureLine?: string, force?: boolean, profileName?: string, remotePort?: number } = {},
+): Promise<string[]> {
+  const failureLine = options.failureLine ?? 'bootstrap 失败'
+  const force = options.force === true
+  const { onEvent, onProgress } = hooks
+  let log = ''
+  const skips: string[] = []
+  const dispatch = createBootstrapLineDispatcher((line) => {
+    const parsed = parseBootstrapLine(line)
+    if (parsed.stage === 'verify' && parsed.line.includes('跳过'))
+      skips.push(parsed.line)
+    onEvent?.(parsed.stage, parsed.line)
+  })
+  const result = await session.exec(buildInstallScript(plan, {
+    force,
+    ...(options.profileName === undefined ? {} : { profileName: options.profileName }),
+    ...(options.remotePort === undefined ? {} : { remotePort: options.remotePort }),
+  }), {
+    timeoutMs: installTimeoutMs,
+    onData: (chunk) => {
+      log = `${log}${chunk}`.slice(-2000)
+      dispatch.push(chunk)
+      onProgress?.({ phase: 'installing', log })
+    },
+  })
+  dispatch.flush()
+  if (result.code !== 0) {
+    const streamed = log.trim()
+    const collected = streamed !== '' ? streamed : result.stdout.trim()
+    const stream = collected !== '' ? collected : result.stderr.trim()
+    const tail = stream === '' ? '(no output captured)' : stream.split('\n').slice(-5).join(' | ')
+    failBootstrap(onEvent, `install failed on remote (exit ${result.code ?? '?'}): ${tail}`, failureLine)
+  }
+  return skips
+}
+
+function emitReady(
+  onEvent: BootstrapHooks['onEvent'],
+  target: string,
+  verdict: string,
+  skipSummary = '',
+): void {
+  const base = verdict.startsWith('boot')
+    ? `远端实例已就绪 (${target})`
+    : `远端实例已就绪（${verdict}）`
+  onEvent?.('ready', `${base}${skipSummary}`, { terminal: 'success' })
+}
+
+function failBootstrap(onEvent: BootstrapHooks['onEvent'], reason: string, line = 'bootstrap 失败'): never {
+  onEvent?.('failed', line, { terminal: 'failed', reason })
+  throw new Error(reason)
+}
+
+async function logTail(session: RemoteSession, remotePort: number): Promise<string> {
+  try {
+    const result = await session.exec(logTailCommand(remotePort))
+    const tail = result.stdout.trim()
+    return tail === '' ? '(log is empty)' : tail.split('\n').slice(-5).join(' | ')
+  }
+  catch {
+    return '(log unreadable)'
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}

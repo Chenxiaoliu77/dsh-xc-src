@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly EXCLUDED_LIBS=(
+  libwayland-client.so.0
+  libwayland-cursor.so.0
+  libwayland-egl.so.1
+  libwayland-server.so.0
+  libxkbcommon.so.0
+  libxcb-randr.so.0
+  libxcb-render.so.0
+  libxcb-shm.so.0
+  libXau.so.6
+  libXdmcp.so.6
+)
+
+# 与 linuxdeploy 产出的 squashfs 对齐（实测 zstd / 128K block / 单一 root id）。
+readonly SQUASHFS_COMPRESSION=zstd
+readonly SQUASHFS_BLOCK_SIZE=131072
+readonly GTK_HOOK=apprun-hooks/linuxdeploy-plugin-gtk.sh
+readonly GDK_OVERRIDE_PATTERN='^[[:space:]]*export[[:space:]]+GDK_BACKEND=x11([[:space:]]+#.*)?[[:space:]]*$'
+readonly GSTREAMER_SOURCE_PATTERN='^[[:space:]]*source[[:space:]].*apprun-hooks/linuxdeploy-plugin-gstreamer[.]sh[[:space:]]*$'
+readonly GSTREAMER_NATIVE_PATTERN='GST_PLUGIN_SYSTEM_PATH(_1_0)?='
+# #1269：宿主 GStreamer(>=1.24) 链接新版 GLib，镜像里 22.04 的 GLib 2.72 被 LD_LIBRARY_PATH 置顶后缺 g_once_init_leave_pointer，加载器在 main() 前中止。
+# #1299：同时交还宿主依赖，避免新版 GIO 继续加载缺少 MOUNT_2_40 等符号的旧库。
+readonly EXCLUDED_GLIB=(
+  'libglib-2.0.so*'
+  'libgobject-2.0.so*'
+  'libgio-2.0.so*'
+  'libgmodule-2.0.so*'
+  'libgthread-2.0.so*'
+  'libmount.so*'
+  'libpcre2-8.so*'
+  'libselinux.so*'
+  'libsystemd.so*'
+  'libdbus-1.so*'
+)
+readonly EXCLUDED_MEDIA=(
+  'libgst*.so*'
+  gstreamer-1.0
+  gstreamer1.0
+  gst-plugin-scanner
+  gst-ptp-helper
+  linuxdeploy-plugin-gstreamer.sh
+  'libsoup-2.4.so*'
+  'libgupnp*.so*'
+)
+# #1407：镜像只打包了半个 NSS（无 libsoftokn3/libfreebl3），宿主 softoken 在镜像内旧
+# libnssutil3 之下缺 NSSUTIL_3.108 版本符号，加载失败后 Chromium 在 crypto/nss_util.cc
+# 触发 int3（SIGTRAP，实测 Fedora 45 / Arch）。deb 不打包 NSS 且正常，故交还宿主。
+# 注意勿写成 libnss*.so*：那会命中 glibc 的 libnss_files.so.2 等 name service 模块。
+readonly EXCLUDED_NSS=(
+  'libnss3.so*'
+  'libnssutil3.so*'
+  'libsmime3.so*'
+  'libnspr4.so*'
+  'libplc4.so*'
+  'libplds4.so*'
+)
+# 镜像内 OpenSSL 3.0 / krb5 早于宿主 libcurl、git 所需的 OPENSSL_3.5.0 与
+# krb5support_0_MIT k5_buf_cstring：LD_LIBRARY_PATH 置顶后宿主 git-remote-https
+# 直接 `fatal: remote helper 'https' aborted session`，git 托管插件安装全灭。
+readonly EXCLUDED_CRYPTO=(
+  'libssl.so.3*'
+  'libcrypto.so.3*'
+  'libkrb5.so.3*'
+  'libk5crypto.so.3*'
+  'libkrb5support.so.0*'
+  'libgssapi_krb5.so.2*'
+  'libkeyutils.so.1*'
+)
+# #1407 残留：libcups.so.2 是镜像内唯一 DT_NEEDED libgssapi_krb5.so.2（gssapi_krb5_2_MIT）
+# 的 ELF，krb5 链交还宿主后它就变成悬空依赖；libprintbackend-cups.so 是 libcups 的唯一消费者。
+# libgcrypt.so.20 无人 NEEDED，且它自己 NEEDED 的 libgpg-error.so.0 从来没被打包进来。
+# 三者都不该留在镜像里：Electron 主程序本身就硬 NEEDED libcups.so.2，宿主必须提供，与 deb 一致。
+readonly EXCLUDED_LINKAGE=(
+  'libcups.so.2*'
+  'libprintbackend-cups.so*'
+  'libgcrypt.so*'
+)
+readonly EXCLUDED_ALL=(
+  "${EXCLUDED_LIBS[@]}"
+  "${EXCLUDED_GLIB[@]}"
+  "${EXCLUDED_MEDIA[@]}"
+  "${EXCLUDED_NSS[@]}"
+  "${EXCLUDED_CRYPTO[@]}"
+  "${EXCLUDED_LINKAGE[@]}"
+)
+
+# 在镜像中扫描 squashfs 4.0 superblock：magic "hsqs"，版本字段 s_major/s_minor == 4/0，
+# block_size 为 2 的幂且在 [4096, 1048576]，compression 在 1..6，block_log 与 block_size 自洽。
+# Type-2 AppImage 的尾部是 ELF runtime，正文里还可能出现字面量 "hsqs"，因此必须逐个按
+# superblock 字段校验，而不是命中第一个 magic 就返回（实测镜像里第一个 "hsqs" 是误报）。
+detect_squashfs_offset() {
+  local file="$1"
+  python3 - "$file" <<'PY'
+import struct
+import sys
+
+path = sys.argv[1]
+with open(path, 'rb') as handle:
+    data = handle.read()
+
+start = 0
+while True:
+    index = data.find(b'hsqs', start)
+    if index < 0:
+        break
+    start = index + 1
+    if index + 32 > len(data):
+        continue
+    (magic, _inodes, _mtime, block_size, _fragments, compression, block_log,
+     _flags, _no_ids, s_major, s_minor) = struct.unpack_from('<IIIIIHHHHHH', data, index)
+    if magic != 0x73717368:
+        continue
+    if s_major != 4 or s_minor != 0:
+        continue
+    if block_size < 4096 or block_size > 1048576 or block_size & (block_size - 1):
+        continue
+    if compression < 1 or compression > 6:
+        continue
+    if (1 << block_log) != block_size:
+        continue
+    print(index)
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+
+usage() {
+  echo "usage: $(basename "$0") [--require-removal] <path-to.AppImage>" >&2
+}
+
+# CI 用 --require-removal：linuxdeploy 升级后若不再过度打包这些库，剔除会静默变成
+# no-op，届时 #620 会悄悄回归。要求「至少剔掉一个」把这种退化变成构建失败。
+require_removal=0
+if [ "${1:-}" = "--require-removal" ]; then
+  require_removal=1
+  shift
+fi
+
+appimage="${1:-}"
+if [ -z "$appimage" ]; then
+  usage
+  exit 2
+fi
+if [ ! -f "$appimage" ]; then
+  echo "fix-appimage-host-libs: no such file: $appimage" >&2
+  exit 1
+fi
+
+appimage="$(cd "$(dirname "$appimage")" && pwd)/$(basename "$appimage")"
+
+for tool in mksquashfs unsquashfs; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "fix-appimage-host-libs: required tool not found: $tool (install squashfs-tools)" >&2
+    exit 1
+  fi
+done
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+cp "$appimage" "$work/in.AppImage"
+chmod +x "$work/in.AppImage"
+
+# 先让 AppImage 自带 runtime 报出 squashfs 偏移并解包（不挂载 FUSE，容器里可直接跑）。
+# runtime 不可执行时（noexec 挂载等）退回扫描 superblock + unsquashfs -o。
+offset=""
+if offset="$("$work/in.AppImage" --appimage-offset 2>/dev/null)" && [ -n "$offset" ]; then
+  case "$offset" in
+    *[!0-9]*)
+      echo "fix-appimage-host-libs: unexpected AppImage offset: $offset" >&2
+      exit 1
+      ;;
+  esac
+else
+  # 注意 set -e：赋值里的命令替换失败会直接终止脚本，因此必须用 `|| true` 兜住，
+  # 否则扫描失败时既拿不到下面的明确报错，也看不到自己写的诊断信息。
+  offset="$(detect_squashfs_offset "$work/in.AppImage" || true)"
+  if [ -z "$offset" ]; then
+    echo "fix-appimage-host-libs: runtime unusable and no squashfs superblock found in $appimage" >&2
+    exit 1
+  fi
+  echo "fix-appimage-host-libs: runtime unusable, scanned squashfs offset $offset"
+fi
+
+tree="$work/squashfs-root"
+if ! (
+  cd "$work"
+  ./in.AppImage --appimage-extract >/dev/null 2>&1
+) || [ ! -d "$tree" ]; then
+  rm -rf "$tree"
+  if ! unsquashfs -o "$offset" -d "$tree" "$work/in.AppImage" >/dev/null; then
+    echo "fix-appimage-host-libs: extraction failed (runtime and unsquashfs)" >&2
+    exit 1
+  fi
+fi
+if [ ! -d "$tree" ]; then
+  echo "fix-appimage-host-libs: extraction produced no root directory" >&2
+  exit 1
+fi
+
+removed=()
+# #1209：整套媒体栈交给宿主，避免版本混用。#1165：libsoup-2.4 混进 WebKitGTK 的 libsoup-3 进程会 SIGTRAP，打包物里不得残留。
+for lib in "${EXCLUDED_ALL[@]}"; do
+  while IFS= read -r -d '' found; do
+    rm -rf "$found"
+    removed+=("${found#"$tree"/}")
+  done < <(find "$tree" -name "$lib" -prune -print0)
+done
+
+launcher_changed=0
+if grep -Eq "$GSTREAMER_SOURCE_PATTERN" "$tree/AppRun"; then
+  sed -Ei "\|$GSTREAMER_SOURCE_PATTERN|d" "$tree/AppRun"
+  launcher_changed=1
+fi
+
+native_changed=0
+# #1209：apprun-old 用 Qt 路径覆盖 GST；等长改名保留宿主默认值及用户配置。
+if [ -f "$tree/AppRun.wrapped" ] && grep -aEq "$GSTREAMER_NATIVE_PATTERN" "$tree/AppRun.wrapped"; then
+  sed -Ei 's/GST_PLUGIN_SYSTEM_PATH(_1_0)?=/DSH_PLUGIN_SYSTEM_PATH\1=/g' "$tree/AppRun.wrapped"
+  native_changed=1
+fi
+
+hook_changed=0
+# #789：在启动钩子处删除上游强制值，保留用户的 GDK_BACKEND 与其余 GTK 环境。
+if [ -f "$tree/$GTK_HOOK" ] && grep -Eq "$GDK_OVERRIDE_PATTERN" "$tree/$GTK_HOOK"; then
+  sed -Ei "/$GDK_OVERRIDE_PATTERN/d" "$tree/$GTK_HOOK"
+  hook_changed=1
+fi
+
+if [ "${#removed[@]}" -eq 0 ]; then
+  if [ "$require_removal" -eq 1 ]; then
+    echo "fix-appimage-host-libs: none of the host-interface libraries or media stack were bundled, but" >&2
+    echo "  --require-removal was requested: the over-bundling this guards against (#620, #1209)" >&2
+    echo "  is no longer happening, or the bundler changed. Re-verify before dropping the fix." >&2
+    exit 1
+  fi
+  if [ "$hook_changed" -eq 0 ] && [ "$launcher_changed" -eq 0 ] && [ "$native_changed" -eq 0 ]; then
+    echo "fix-appimage-host-libs: no bundled host/media stack or forced GTK backend, nothing to do"
+    exit 0
+  fi
+fi
+
+if [ "${#removed[@]}" -gt 0 ]; then
+  echo "fix-appimage-host-libs: removed from AppDir:"
+  printf '  %s\n' "${removed[@]}"
+fi
+if [ "$hook_changed" -eq 1 ]; then
+  echo "fix-appimage-host-libs: removed GTK hook's forced GDK_BACKEND=x11"
+fi
+
+head -c "$offset" "$work/in.AppImage" > "$work/out.AppImage"
+mksquashfs "$tree" "$work/fs.squashfs" \
+  -comp "$SQUASHFS_COMPRESSION" \
+  -b "$SQUASHFS_BLOCK_SIZE" \
+  -all-root -mkfs-time 0 -no-xattrs -noappend -no-progress -quiet
+cat "$work/fs.squashfs" >> "$work/out.AppImage"
+chmod +x "$work/out.AppImage"
+
+# 交付前自检：库确实消失、AppRun 与主程序仍在、新镜像仍能被 runtime 解析。
+# 在独立目录解包，避免与已剔除的 $tree 混在一起而看漏残留库。
+verify="$work/verify"
+mkdir -p "$verify"
+verdict=0
+if (
+  cd "$verify"
+  ../out.AppImage --appimage-extract >/dev/null 2>&1
+) && [ -d "$verify/squashfs-root" ]; then
+  verified="$verify/squashfs-root"
+else
+  rm -rf "$verify/squashfs-root"
+  if unsquashfs -o "$offset" -d "$verify/squashfs-root" "$work/out.AppImage" >/dev/null 2>&1; then
+    verified="$verify/squashfs-root"
+  else
+    echo "fix-appimage-host-libs: verification failed, repacked image cannot be extracted" >&2
+    exit 1
+  fi
+fi
+
+for lib in "${EXCLUDED_ALL[@]}"; do
+  if find "$verified" -name "$lib" -print -quit | grep -q .; then
+    echo "fix-appimage-host-libs: verification failed, $lib is still bundled" >&2
+    verdict=1
+  fi
+done
+if find "$verified" -type f \( -name 'libgstsoup.so' -o -name 'libgstwebrtc.so' \) -print -quit | grep -q .; then
+  echo "fix-appimage-host-libs: verification failed, libsoup-2.4 GStreamer plugins are still bundled (#1165)" >&2
+  verdict=1
+fi
+# #1407：krb5 链被剔除后，libcups 这类 NEEDED 它会变成悬空依赖；NEEDED 闭合性的全量检查
+# 由 scripts/appimage_lib_closure.py 在 CI 的 check-linux-glibc-abi.sh 里做，此处只守 libsoup。
+if command -v readelf >/dev/null 2>&1; then
+  while IFS= read -r -d '' elf; do
+    if readelf -d "$elf" 2>/dev/null | grep -q 'NEEDED.*libsoup-2[.]4'; then
+      echo "fix-appimage-host-libs: verification failed, ${elf#"$verified"/} still links libsoup-2.4 (#1165)" >&2
+      verdict=1
+    fi
+  done < <(find "$verified/usr" -type f \( -name '*.so' -o -name '*.so.*' \) -print0)
+fi
+if [ -f "$verified/AppRun.wrapped" ] && grep -aEq "$GSTREAMER_NATIVE_PATTERN" "$verified/AppRun.wrapped"; then
+  echo "fix-appimage-host-libs: verification failed, native AppRun still overrides the host GStreamer path" >&2
+  verdict=1
+fi
+if grep -Eq "$GSTREAMER_SOURCE_PATTERN" "$verified/AppRun"; then
+  echo "fix-appimage-host-libs: verification failed, AppRun still sources the removed GStreamer hook" >&2
+  verdict=1
+fi
+if [ -f "$verified/$GTK_HOOK" ] && grep -Eq "$GDK_OVERRIDE_PATTERN" "$verified/$GTK_HOOK"; then
+  echo "fix-appimage-host-libs: verification failed, GTK hook still forces GDK_BACKEND=x11" >&2
+  verdict=1
+fi
+if [ "$hook_changed" -eq 1 ] && [ ! -f "$verified/$GTK_HOOK" ]; then
+  echo "fix-appimage-host-libs: verification failed, GTK hook is missing" >&2
+  verdict=1
+fi
+for required in AppRun AppRun.wrapped; do
+  if [ ! -f "$verified/$required" ] || [ ! -x "$verified/$required" ]; then
+    echo "fix-appimage-host-libs: verification failed, $required is missing or not executable" >&2
+    verdict=1
+  fi
+done
+if ! python3 - "$verified" <<'PY_ELECTRON'
+import json
+import os
+from pathlib import Path
+import struct
+import sys
+
+root = Path(sys.argv[1])
+markers = list((root / 'usr/lib').glob('*/runtime/linux-*/electron-rs.json'))
+if len(markers) != 1:
+    sys.exit('fix-appimage-host-libs: verification failed, expected one bundled Linux Electron runtime')
+dist = markers[0].parent
+metadata = json.loads(markers[0].read_text())
+arch = metadata.get('arch')
+if metadata.get('target') != 'linux' or arch not in ('x64', 'arm64') or dist.name != f'linux-{arch}':
+    sys.exit('fix-appimage-host-libs: verification failed, incompatible Electron runtime metadata')
+binary = dist / metadata['binary']
+if not binary.resolve().is_relative_to(dist.resolve()) or not binary.is_file() or not os.access(binary, os.X_OK):
+    sys.exit('fix-appimage-host-libs: verification failed, Electron executable is missing or not executable')
+with binary.open('rb') as handle:
+    header = handle.read(20)
+if len(header) < 20 or header[:6] != b'\x7fELF\x02\x01' or struct.unpack_from('<H', header, 18)[0] != {'x64': 62, 'arm64': 183}[arch]:
+    sys.exit('fix-appimage-host-libs: verification failed, incompatible Electron ELF executable')
+for required in ('main.cjs', 'preload.cjs', 'icudtl.dat', 'resources.pak', 'libffmpeg.so', 'libvulkan.so.1', 'libvk_swiftshader.so', 'vk_swiftshader_icd.json'):
+    path = dist / required
+    if not path.is_file() or path.stat().st_size == 0:
+        sys.exit(f'fix-appimage-host-libs: verification failed, Electron {required} is missing or empty')
+PY_ELECTRON
+then
+  verdict=1
+fi
+if ! find "$verified/usr/bin" -type f -perm -u+x -print -quit | grep -q .; then
+  echo "fix-appimage-host-libs: verification failed, no executable remained in usr/bin" >&2
+  verdict=1
+fi
+[ "$verdict" -eq 0 ] || exit 1
+
+mv "$work/out.AppImage" "$appimage"
+echo "fix-appimage-host-libs: repacked $(basename "$appimage") (${#removed[@]} bundled host/media entries dropped)"
