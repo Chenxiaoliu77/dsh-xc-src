@@ -6,9 +6,9 @@ use std::time::Duration;
 /// 运行，不再下载、安装或解析独立 Node。
 pub const LEGACY_NODE_ROOT_DIR: &str = "runtime";
 
-/// 打包的 DeepSeek Harness 发行版下载地址（GitHub Release，默认首选源）
+/// 打包的 DeepSeek Harness 发行版下载地址（自有内核镜像仓库，GitHub Release 首选源）
 pub const DSH_CORE_URL: &str =
-    "https://github.com/dsh-tauri/deepseek-harness-pkg/releases/latest/download/";
+    "https://github.com/Chenxiaoliu77/dsh-xc-kernel/releases/latest/download/";
 
 /// GitHub Release 的代理镜像前缀列表（透传官方 URL，下载内容一致、
 /// 仍可做 SHA-256 完整性校验），按实测延迟从低到高排列，官方直连失败时依次兜底。
@@ -118,7 +118,7 @@ pub const STORE_PENDING_INSTALLER_KEY: &str = "desktop_pending_installer";
 ///
 /// 走 `github.com` 而非 `api.github.com`，不受未认证 API 限流约束；该地址可达即代表
 /// 下载与更新检查这条出网链路可用。
-pub const PROXY_TEST_URL: &str = "https://github.com/hairyf/deepseek-harness-desktop/releases.atom";
+pub const PROXY_TEST_URL: &str = "https://github.com/Chenxiaoliu77/dsh-xc-release/releases.atom";
 
 /// 代理连通性测试的整体请求截止时间（reqwest `.timeout()`：从开始建连到响应头读完）。
 ///
