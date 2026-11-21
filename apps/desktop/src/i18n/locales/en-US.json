@@ -748,5 +748,8 @@
   "network.test_connect": "Could not connect to the proxy. Check the address and port.",
   "network.test_status": "Proxy reachable, but the update source returned {{status}}",
   "network.test_failed": "Proxy test failed",
-  "ui.languages.ru": "Russian"
+  "ui.languages.ru": "Russian",
+  "ui.log_path": "Log Path",
+  "buttons.refresh": "Refresh",
+  "debug.info_failed": "Failed to load runtime information. Please retry."
 }

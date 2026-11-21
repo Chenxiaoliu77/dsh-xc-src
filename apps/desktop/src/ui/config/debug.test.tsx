@@ -16,11 +16,13 @@ const mocks = vi.hoisted(() => ({
   changeLanguage: vi.fn(async () => {}),
   openBrowser: vi.fn(),
   reloadWebview: vi.fn(),
+  writeClipboardText: vi.fn(async () => {}),
 }))
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }))
 vi.mock('@/utils/toast', () => ({ toast: mocks.toast }))
+vi.mock('@/utils/clipboard', () => ({ writeClipboardText: mocks.writeClipboardText }))
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'zh-CN' } }),
 }))
@@ -101,7 +103,7 @@ beforeEach(() => {
     if (command === 'get_app_config')
       return Promise.resolve({ ...mocks.settingState })
     if (command === 'get_runtime_info')
-      return Promise.resolve({ app_version: '1.0.0', dsh_version: '1.0.0', node_version: '22.0.0', platform: 'linux', arch: 'x64', service_url: 'http://127.0.0.1:3080', harness_path: '', data_dir: '', node_path: '', pnpm_path: '' })
+      return Promise.resolve({ app_version: '1.0.0', dsh_version: '1.0.0', node_version: '22.0.0', platform: 'linux', arch: 'x64', service_url: 'http://127.0.0.1:3080', data_dir: '/tmp/test-data', log_path: '/tmp/test.log' })
     if (command === 'get_cli_link_status')
       return Promise.resolve({ enabled: false, shim_exists: false, path_registered: false, user_dsh_preserved: false, bin_dir: '', shim_path: '' })
     if (command === 'test_proxy')
@@ -348,5 +350,65 @@ describe('配置面板的运行控制按钮', () => {
 
     const reload = await screen.findByRole('button', { name: 'app.reload_page' })
     expect((reload as HTMLButtonElement).disabled).toBe(true)
+  })
+})
+
+describe('配置面板的调试信息与快捷操作', () => {
+  it('展示运行时信息中的数据目录与日志路径', async () => {
+    renderDebug()
+
+    expect(await screen.findByText('/tmp/test-data')).toBeTruthy()
+    expect(screen.getByText('/tmp/test.log')).toBeTruthy()
+  })
+
+  it('服务停止时仍保留可用的重启入口，隐藏关闭按钮', async () => {
+    mocks.harnessState.serviceRunning = false
+    renderDebug()
+
+    const restart = await screen.findByTestId('dsh-config-restart')
+    expect((restart as HTMLButtonElement).disabled).toBe(false)
+    expect(screen.queryByRole('button', { name: 'app.shutdown' })).toBeNull()
+  })
+
+  it('复制日志按钮读取运行日志并交给剪贴板工具', async () => {
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'read_run_logs')
+        return Promise.resolve('line1\nline2')
+      if (command === 'get_runtime_info')
+        return Promise.resolve({ app_version: '1.0.0', node_version: '22.0.0', platform: 'linux', arch: 'x64', service_url: 'http://127.0.0.1:3080', data_dir: '/tmp/test-data', log_path: '/tmp/test.log' })
+      if (command === 'get_cli_link_status')
+        return Promise.resolve({ enabled: false, bin_dir: '', shim_path: '' })
+      return Promise.resolve(null)
+    })
+    renderDebug()
+
+    fireEvent.click(await screen.findByTestId('dsh-config-copy-logs'))
+
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('read_run_logs'))
+    await waitFor(() => expect(mocks.writeClipboardText).toHaveBeenCalledWith('line1\nline2', 'messages.logs_copied'))
+  })
+
+  it('打开数据目录按钮触发原生 reveal_data_dir 命令', async () => {
+    renderDebug()
+
+    fireEvent.click(await screen.findByTestId('dsh-config-reveal-dir'))
+
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('reveal_data_dir'))
+  })
+
+  it('运行时信息读取失败时显示错误条，重试会重新拉取', async () => {
+    const fallback = mocks.invoke.getMockImplementation()!
+    mocks.invoke.mockImplementation((command: string, ...args: unknown[]) =>
+      command === 'get_runtime_info'
+        ? Promise.reject(new Error('RUNTIME_INFO_UNAVAILABLE'))
+        : fallback(command, ...args),
+    )
+    renderDebug()
+
+    expect(await screen.findByTestId('dsh-config-info-error')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'app.retry' }))
+
+    await waitFor(() => expect(mocks.invoke.mock.calls.filter(([command]) => command === 'get_runtime_info').length).toBeGreaterThanOrEqual(2))
   })
 })

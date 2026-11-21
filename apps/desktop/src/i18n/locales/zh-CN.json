@@ -748,5 +748,8 @@
   "network.test_connect": "无法连接到代理，请检查地址和端口",
   "network.test_status": "代理可达，但更新源返回 {{status}}",
   "network.test_failed": "代理测试失败",
-  "ui.languages.ru": "俄语"
+  "ui.languages.ru": "俄语",
+  "ui.log_path": "日志路径",
+  "buttons.refresh": "刷新",
+  "debug.info_failed": "读取运行时信息失败，请重试"
 }

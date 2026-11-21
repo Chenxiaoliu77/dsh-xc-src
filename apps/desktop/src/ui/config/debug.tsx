@@ -54,7 +54,7 @@ export function ConfigDebug() {
   const [proxyInput, setProxyInput] = useState<string>()
   const [heapInput, setHeapInput] = useState<string>()
 
-  const { data: info, refetch: refreshInfo } = useQuery({
+  const { data: info, refetch: refreshInfo, error: infoError } = useQuery({
     queryKey: queryKeys.info,
     queryFn: () => invoke<RuntimeInfo>('get_runtime_info'),
   })
@@ -73,7 +73,7 @@ export function ConfigDebug() {
   /** 空输入代表自动值（null），其余按数字解析，非法值交给保存前的整数校验拦下 */
   const parsedHeap = heapValue.trim() === '' ? null : Number(heapValue)
 
-  const { data: cliStatus, refetch: refreshCliStatus } = useQuery({
+  const { data: cliStatus, refetch: refreshCliStatus, error: cliError } = useQuery({
     queryKey: queryKeys.cliStatus,
     queryFn: () => invoke<CliLinkStatus>('get_cli_link_status'),
   })
@@ -105,6 +105,27 @@ export function ConfigDebug() {
     },
   })
 
+  // 调试常用的两个快捷动作：日志与数据目录。两者都可能失败（权限、目录被删），
+  // 失败必须可见，否则开发者会以为按钮没生效。writeClipboardText 自带成功/失败提示。
+  const { mutate: onCopyLogs, isPending: copyingLogs } = useMutation({
+    mutationFn: async () => {
+      const logs = await invoke<string>('read_run_logs')
+      await writeClipboardText(logs, t('messages.logs_copied'))
+    },
+    onError: (err: unknown) => {
+      console.error('[ConfigDebug] copy run logs failed:', err)
+      toast(t('messages.logs_read_failed'), { variant: 'danger' })
+    },
+  })
+
+  const { mutate: onRevealDataDir } = useMutation({
+    mutationFn: () => invoke('reveal_data_dir'),
+    onError: (err: unknown) => {
+      console.error('[ConfigDebug] reveal data dir failed:', err)
+      toast(t('messages.reveal_dir_failed'), { variant: 'danger' })
+    },
+  })
+
   const { mutate: onCopyEnvironment, isPending: copyingEnvironment } = useMutation({
     mutationFn: async () => {
       if (!info)
@@ -114,10 +135,14 @@ export function ConfigDebug() {
         `${t('ui.dsh_version')}: ${info.dsh_version ?? '-'}`,
         `${t('ui.node_version')}: ${info.node_version ? `v${info.node_version}` : '-'}`,
         `${t('ui.platform')}: ${info.platform} / ${info.arch}`,
+        `${t('ui.service_url')}: ${info.service_url}`,
+        `${t('ui.data_dir')}: ${info.data_dir}`,
+        `${t('ui.log_path')}: ${info.log_path ?? '-'}`,
       ].join('\n'), t('messages.environment_copied'))
     },
     onError: (err: unknown) => {
       console.error('[ConfigDebug] copy environment info failed:', err)
+      toast(t('messages.copy_failed'), { variant: 'danger' })
     },
   })
 
@@ -249,17 +274,52 @@ export function ConfigDebug() {
         title={t('config.application')}
         testId="dsh-config-panel-title"
         action={(
+          <div className="flex items-center gap-1.5">
+            <Button
+              size="sm"
+              variant="ghost"
+              isIconOnly
+              aria-label={t('buttons.refresh')}
+              data-testid="dsh-config-refresh-info"
+              onPress={() => {
+                void refreshInfo()
+                void refreshCliStatus()
+              }}
+            >
+              <ArrowRotateRight className="size-3.5" />
+            </Button>
+            <Button
+              size="sm"
+              variant="tertiary"
+              isDisabled={!info || copyingEnvironment}
+              onPress={() => onCopyEnvironment()}
+            >
+              <If cond={copyingEnvironment} then={<Spinner size="sm" color="current" />} else={<Copy className="size-3.5" />} />
+              {t('buttons.copy_environment')}
+            </Button>
+          </div>
+        )}
+      />
+      <If cond={Boolean(infoError || cliError)}>
+        <div
+          className="flex items-center justify-between gap-2 rounded-md border border-danger/30 bg-danger/5 px-2.5 py-2"
+          data-testid="dsh-config-info-error"
+        >
+          <span className="text-[11px] text-danger">{t('debug.info_failed')}</span>
           <Button
             size="sm"
             variant="tertiary"
-            isDisabled={!info || copyingEnvironment}
-            onPress={() => onCopyEnvironment()}
+            className="h-7"
+            onPress={() => {
+              void refreshInfo()
+              void refreshCliStatus()
+            }}
           >
-            <If cond={copyingEnvironment} then={<Spinner size="sm" color="current" />} else={<Copy className="size-3.5" />} />
-            {t('buttons.copy_environment')}
+            <ArrowRotateRight className="size-3" />
+            {t('app.retry')}
           </Button>
-        )}
-      />
+        </div>
+      </If>
       <div className="space-y-1.5">
         <div className="flex items-center justify-between">
           <span className="text-xs font-semibold uppercase tracking-wider text-muted">
@@ -316,18 +376,42 @@ export function ConfigDebug() {
           </div>
         </div>
       </div>
+      <div className="flex items-center gap-1.5" data-testid="dsh-config-debug-actions">
+        <Button
+          size="sm"
+          variant="tertiary"
+          className="flex-1"
+          isDisabled={copyingLogs}
+          onPress={() => onCopyLogs()}
+          data-testid="dsh-config-copy-logs"
+        >
+          <If cond={copyingLogs} then={<Spinner size="sm" color="current" />} else={<Copy className="size-3.5" />} />
+          {t('buttons.copy_logs')}
+        </Button>
+        <Button
+          size="sm"
+          variant="tertiary"
+          className="flex-1"
+          onPress={() => onRevealDataDir()}
+          data-testid="dsh-config-reveal-dir"
+        >
+          <ArrowUpRightFromSquare className="size-3.5" />
+          {t('app.reveal_dir')}
+        </Button>
+      </div>
       <div className="flex items-center gap-2">
+        <Button
+          size="sm"
+          variant="tertiary"
+          className={serviceRunning ? 'flex-1' : 'w-full'}
+          onPress={store.harness.restart}
+          isDisabled={busyAction !== null}
+          data-testid="dsh-config-restart"
+        >
+          <If cond={busyAction === 'restart'} then={<Spinner size="sm" color="current" />} else={<ArrowRotateRight className="size-3.5" />} />
+          {t('app.restart')}
+        </Button>
         <If cond={serviceRunning}>
-          <Button
-            size="sm"
-            variant="tertiary"
-            className="flex-1"
-            onPress={store.harness.restart}
-            isDisabled={busyAction !== null}
-          >
-            <If cond={busyAction === 'restart'} then={<Spinner size="sm" color="current" />} else={<ArrowRotateRight className="size-3.5" />} />
-            {t('app.restart')}
-          </Button>
           <Button
             size="sm"
             variant="danger"
@@ -357,6 +441,12 @@ export function ConfigDebug() {
           <Info term={t('ui.node_version')}>{info?.node_version ? `v${info.node_version}` : '-'}</Info>
           <Info term={t('ui.platform')}>
             {info ? `${info.platform} / ${info.arch}` : '-'}
+          </Info>
+          <Info term={t('ui.data_dir')}>
+            <span className="break-all font-mono text-[11px]">{info?.data_dir || '-'}</span>
+          </Info>
+          <Info term={t('ui.log_path')}>
+            <span className="break-all font-mono text-[11px]">{info?.log_path || '-'}</span>
           </Info>
         </div>
       </div>
