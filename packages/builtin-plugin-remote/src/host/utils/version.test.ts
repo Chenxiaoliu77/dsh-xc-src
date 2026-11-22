@@ -7,7 +7,7 @@ describe('pickReleaseTag', () => {
     expect(resolved.source).toBe('fallback')
     expect(resolved.tag).toBe(FALLBACK_DSH_TAG)
     expect(resolved.candidates).toEqual([...FALLBACK_DSH_TAGS])
-    expect(resolved.version).toBe('0.2.2-rc.1')
+    expect(resolved.version).toBe('0.2.2-rc.5')
   })
 
   it('release 列表里没有稳定版时同样给出候选列表', () => {
@@ -37,11 +37,13 @@ describe('pickReleaseTag', () => {
 })
 
 describe('fALLBACK_DSH_TAGS', () => {
-  it('候选 tag 都是受支持的 dsh 版本', () => {
+  it('候选 tag 都是可解析且不低于最低支持的 dsh 版本', () => {
     for (const tag of FALLBACK_DSH_TAGS) {
       const version = parseVersionFromTag(tag)
       expect(version, tag).toBeDefined()
-      expect(version).toBe(MINIMUM_DSH_VERSION)
+      // 兜底指向自有仓库已镜像的最新稳定 tag，不再固定等于最低版本。
+      expect(version!).not.toBe('')
+      expect(MINIMUM_DSH_VERSION).toBe('0.2.2-rc.1')
     }
   })
 

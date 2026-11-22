@@ -24,10 +24,11 @@ export const MINIMUM_DSH_VERSION = __REMOTE_DSH_MINIMUM__
  * 回退 tag 列表（按新到旧）。必须是真实存在的 release：上游删掉 release 后
  * git tag 仍在，但 `/releases/download/<tag>/<asset>` 会 404，远端安装以 exit 10 收场。
  */
-// 只保留上游真实存在的 tag：其余三个早已 404，留着只会在远端安装时逐一失败。
-// 该 tag 已原样镜像到 Chenxiaoliu77/dsh-xc-kernel（资产与 SHA-256 不变）。
+// 兜底指向自有内核仓已镜像且资产齐全的 tag。
+// 原 rc.1 的四个候选里三个早已 404，唯一存在的一个有资产在上游也 404，无法完整镜像；
+// rc.5 的 12 个资产已原样镜像到 Chenxiaoliu77/dsh-xc-kernel（SHA-256 不变）。
 export const FALLBACK_DSH_TAGS = [
-  'dsh-0.2.2-rc.1-43078653398',
+  'dsh-0.2.2-rc.5-44422722515',
 ] as const
 
 export const FALLBACK_DSH_TAG = FALLBACK_DSH_TAGS[0]
