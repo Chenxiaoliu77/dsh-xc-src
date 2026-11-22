@@ -13,7 +13,9 @@ describe('pickReleaseTag', () => {
   it('release 列表里没有稳定版时同样给出候选列表', () => {
     const resolved = pickReleaseTag([{ tag: 'dsh-0.2.2-alpha.1-1', prerelease: true }])
     expect(resolved.source).toBe('fallback')
-    expect(resolved.candidates.length).toBeGreaterThan(1)
+    // 候选只保留上游真实存在、且已镜像到自有仓库的 tag；其余三个早已 404。
+    expect(resolved.candidates).toEqual([...FALLBACK_DSH_TAGS])
+    expect(resolved.candidates.length).toBeGreaterThan(0)
   })
 
   it('正常列表下选最新的稳定 release', () => {
