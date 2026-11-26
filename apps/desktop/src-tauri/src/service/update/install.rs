@@ -1098,6 +1098,16 @@ pub async fn open_installer(app_handle: &AppHandle, path: String) -> Result<(), 
         release_appimage_instance(app_handle).await?;
         app_handle.exit(0);
     }
+
+    // Windows：NSIS 安装器向导运行期间要覆盖安装目录里的原生模块（tailwindcss
+    // oxide .node 等），主进程还活着就会锁住这些文件，安装器报「无法打开要写入
+    // 的文件」。安装包已交给系统，这里主动退出主进程释放文件锁，让向导顺利完成
+    // （用户取消安装也只是应用退出，可手动重启）。
+    #[cfg(target_os = "windows")]
+    {
+        log::info!("Installer handed to system; exiting to release file locks");
+        app_handle.exit(0);
+    }
     Ok(())
 }
 
