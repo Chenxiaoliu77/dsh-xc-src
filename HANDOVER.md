@@ -94,7 +94,7 @@
 2. ~~对齐版本~~ ✅ Cargo.lock 与 Cargo.toml 一致（deepseek-harness-desktop 0.33.0）。
 3. ~~依赖更新~~ ✅ pnpm 锁文件已对齐（catalogs 全部生效，supply-chain 校验通过）。
 4. ~~验证~~ ✅ cargo check --locked / typecheck / lint / 单测全部通过。
-5. **提交推送**（下一步）：crates 两个子仓库已核实干净（permissions 改动为 CRLF 假差异已还原、source 子模块已恢复记录指针），只需提交根仓库全部改动并推送（git push 需代理 `-c http.proxy=http://127.0.0.1:7890`）。
+5. ~~提交推送~~ ✅ 已提交 `b9cf4ce`（17 files, +636/-456）并推送至 `Chenxiaoliu77/dsh-xc-zuomian` 的 `source` 分支。
 6. **收尾**：用新版品牌安装包做一次端到端更新验证（从自有仓库拉取 → 安装 → 启动）。
 
 ## 7. 风险与注意事项
