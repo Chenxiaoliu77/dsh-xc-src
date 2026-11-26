@@ -9,7 +9,7 @@ import { remoteSlotClaimShell } from '../utils/instance'
 import { GithubHttpError } from '../utils/version'
 import { assertRemoteDshVersion, buildCoreVersionInstallScript, buildInstallScript, planRemoteInstall, planRemoteVersionInstall, readRemoteDshVersion, remoteWebTokenCommand, startCommandFor } from './bootstrap.utils'
 
-const SHELL_AVAILABLE = spawnSync('sh', ['-c', 'command -v ln >/dev/null 2>&1 && command -v kill >/dev/null 2>&1']).status === 0
+const SHELL_AVAILABLE = process.platform !== 'win32' && spawnSync('sh', ['-c', 'command -v ln >/dev/null 2>&1 && command -v kill >/dev/null 2>&1']).status === 0
 
 const LOCK_TEST_SLOT = 'dsh-test'
 
@@ -59,7 +59,7 @@ function sessionOfResult(result: RemoteExecResult): RemoteSession {
   }
 }
 
-const shAvailable = spawnSync('sh', ['-c', 'true']).status === 0
+const shAvailable = SHELL_AVAILABLE
 
 describe.skipIf(!shAvailable)('远端实例启动令牌', () => {
   function tokenOf(home: string, port: number): string {
@@ -278,7 +278,7 @@ describe('指定版本下载脚本', () => {
   })
 })
 
-describe('远端槽位锁的并发行为', () => {
+describe.skipIf(!SHELL_AVAILABLE)('远端槽位锁的并发行为', () => {
   const slot = LOCK_TEST_SLOT
 
   function lockDir(home: string): string {
@@ -620,7 +620,7 @@ describe('planRemoteInstall 的 release 候选选择', () => {
   })
 })
 
-describe('install 脚本的重新安装短路', () => {
+describe.skipIf(!SHELL_AVAILABLE)('install 脚本的重新安装短路', () => {
   function zipPlan(): RemoteInstallPlan {
     return {
       os: 'linux',

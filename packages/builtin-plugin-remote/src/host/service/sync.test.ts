@@ -73,7 +73,7 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true })
 })
 
-const shAvailable = spawnSync('sh', ['-c', 'true']).status === 0
+const shAvailable = process.platform !== 'win32' && spawnSync('sh', ['-c', 'true']).status === 0
 
 describe.skipIf(!shAvailable)('remote selection sync', () => {
   it('installs distinct npm packages with the same version range exactly once each', async () => {

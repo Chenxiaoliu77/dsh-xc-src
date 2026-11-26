@@ -27,7 +27,7 @@ afterEach(() => {
     rmSync(home, { recursive: true, force: true })
 })
 
-const shAvailable = spawnSync('sh', ['-c', 'true']).status === 0
+const shAvailable = process.platform !== 'win32' && spawnSync('sh', ['-c', 'true']).status === 0
 
 describe.skipIf(!shAvailable)('remote core copy probe', () => {
   it('skips staging directories and directories without a core entry', () => {
