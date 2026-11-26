@@ -120,3 +120,14 @@
 - Rust：1.98.1；包管理器：pnpm（monorepo workspace + catalogs）
 - 运行框架：Tauri 2（桌面端）+ Electron runtime 子模块
 - 自有仓库：`Chenxiaoliu77/dsh-xc-release`（release 资产）、`Chenxiaoliu77/dsh-xc-kernel`（内核包）
+
+
+---
+
+## 附：2026-11-26 追加修复与源码发布
+
+1. **更新安装「无法打开要写入的文件」根因与修复**：Windows 上 `open_installer` 只停内核进程、不退出 Electron 主进程，NSIS 向导覆盖安装目录原生模块（tailwindcss oxide .node）时被主进程锁定报错。修复：`install.rs` 在安装包交给系统后主动 `app_handle.exit(0)` 释放文件锁（commit ef72997）。用户当时的弹窗点「忽略/重试」后 0.34.0 已装成功（关于对话框可证）。
+2. **正式版源码发布**：新建公开仓库 `Chenxiaoliu77/dsh-xc-src`，完整源码（source 分支 → main）已推送；关于对话框「源代码」链接从 release 资产仓库改指源码镜像（新增 `SOURCE_URL` 常量，commit 178bcd8）。
+3. **POSIX 测试门控收紧**：槽位锁/token/sh 用例门控统一为 `process.platform !== 'win32'`（commit 3b43016），本机跳过、CI/Linux 照常执行。
+
+> 注：下一版（0.34.1+）安装器才会带上主进程退出修复；当前 0.34.0 用户手动更新仍可能看到一次占用弹窗，点「重试」或先退出应用再装即可。
