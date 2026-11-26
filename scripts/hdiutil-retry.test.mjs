@@ -5,6 +5,8 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterAll, expect, it } from 'vitest'
 
+import { spawnSync } from 'node:child_process'
+const bashAvailable = spawnSync('bash', ['-c', 'true']).status === 0
 const wrapper = fileURLToPath(new URL('./hdiutil-retry/hdiutil', import.meta.url))
 
 const root = mkdtempSync(path.join(tmpdir(), 'hdiutil-retry-'))
@@ -45,7 +47,7 @@ function run(binary, args) {
   })
 }
 
-it('retries the hdiutil flakes GitHub macOS runners report, then succeeds', () => {
+it.skipIf(!bashAvailable)('retries the hdiutil flakes GitHub macOS runners report, then succeeds', () => {
   const { binary, state, output } = fakeHdiutil([
     'hdiutil: create failed - Resource busy',
     'hdiutil: detach: timeout for DiskArbitration expired',
@@ -54,13 +56,13 @@ it('retries the hdiutil flakes GitHub macOS runners report, then succeeds', () =
   expect(readFileSync(state, 'utf8')).toBe('3\n')
 })
 
-it('fails fast on an error that is not the runner flake', () => {
+it.skipIf(!bashAvailable)('fails fast on an error that is not the runner flake', () => {
   const { binary, state } = fakeHdiutil(['hdiutil: create failed - File exists'])
   expect(() => run(binary, ['create', 'image.dmg'])).toThrow()
   expect(readFileSync(state, 'utf8')).toBe('1\n')
 })
 
-it('forces the detach once a retry is needed', () => {
+it.skipIf(!bashAvailable)('forces the detach once a retry is needed', () => {
   const { binary, state } = fakeHdiutil(['hdiutil: detach: drive not detached'])
   run(binary, ['detach', '/dev/disk4'])
   expect(readFileSync(`${state}.argv`, 'utf8').trim().split('\n')).toEqual([

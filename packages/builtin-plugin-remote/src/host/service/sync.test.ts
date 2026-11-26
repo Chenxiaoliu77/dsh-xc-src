@@ -73,7 +73,9 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true })
 })
 
-describe('remote selection sync', () => {
+const shAvailable = spawnSync('sh', ['-c', 'true']).status === 0
+
+describe.skipIf(!shAvailable)('remote selection sync', () => {
   it('installs distinct npm packages with the same version range exactly once each', async () => {
     const one = { name: 'plugin-one', spec: '^1.0.0' }
     const two = { name: 'plugin-two', spec: '^1.0.0' }

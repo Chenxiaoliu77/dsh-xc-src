@@ -59,7 +59,9 @@ function sessionOfResult(result: RemoteExecResult): RemoteSession {
   }
 }
 
-describe('远端实例启动令牌', () => {
+const shAvailable = spawnSync('sh', ['-c', 'true']).status === 0
+
+describe.skipIf(!shAvailable)('远端实例启动令牌', () => {
   function tokenOf(home: string, port: number): string {
     const result = spawnSync('sh', ['-c', remoteWebTokenCommand(port)], { encoding: 'utf8', env: { ...process.env, HOME: home } })
     return result.stdout.trim()
@@ -515,25 +517,23 @@ describe('planRemoteInstall 的 release 候选选择', () => {
     const plan = await planRemoteInstall('Linux x86_64', {}, {
       listReleases: failing,
       listAssets: async (_repo, tag) => {
-        if (tag !== 'dsh-0.2.2-rc.1-43048423223')
+        if (tag !== 'dsh-0.2.2-rc.5-44422722515')
           return []
         return [{ name: 'deepseek-harness-pkg-linux.zip', url: 'https://example.invalid/linux.zip', digest: 'sha256:aa' }]
       },
     })
-    expect(zipPlanOf(plan).tag).toBe('dsh-0.2.2-rc.1-43048423223')
+    expect(zipPlanOf(plan).tag).toBe('dsh-0.2.2-rc.5-44422722515')
     expect(plan.dsh.urls).toContain('https://example.invalid/linux.zip')
   })
 
-  it('首个候选 404 时改用第二个候选的资产', async () => {
-    const plan = await planRemoteInstall('Linux x86_64', {}, {
+  it('唯一候选 404 且探测确认不存在时报告版本不可用', async () => {
+    await expect(planRemoteInstall('Linux x86_64', {}, {
       listReleases: failing,
-      listAssets: async (_repo, tag) => {
-        if (tag === 'dsh-0.2.2-rc.1-43078653398')
-          throw new GithubHttpError('https://api.github.com/repos/x/y/releases/tags/t', 404)
-        return [{ name: 'deepseek-harness-pkg-linux.zip', url: 'https://example.invalid/linux.zip', digest: 'sha256:aa' }]
+      listAssets: async (_repo, _tag) => {
+        throw new GithubHttpError('https://api.github.com/repos/x/y/releases/tags/t', 404)
       },
-    })
-    expect(zipPlanOf(plan).tag).toBe('dsh-0.2.2-rc.1-43048423223')
+      probe: async () => 'missing',
+    })).rejects.toThrow(/REMOTE_DSH_RELEASE_UNAVAILABLE/)
   })
 
   it('元数据不可达时不再逐个查询其余候选', async () => {
@@ -546,7 +546,7 @@ describe('planRemoteInstall 的 release 候选选择', () => {
       },
       probe: async () => 'unknown',
     })
-    expect(queried).toEqual(['dsh-0.2.2-rc.1-43078653398'])
+    expect(queried).toEqual(['dsh-0.2.2-rc.5-44422722515'])
   })
 
   it('全部候选确认不存在时终止规划并报告版本不可用', async () => {
@@ -606,7 +606,7 @@ describe('planRemoteInstall 的 release 候选选择', () => {
       listAssets: failing,
       probe: async () => 'unknown',
     })
-    expect(zipPlanOf(plan).tag).toBe('dsh-0.2.2-rc.1-43078653398')
+    expect(zipPlanOf(plan).tag).toBe('dsh-0.2.2-rc.5-44422722515')
     expect(plan.dsh.urls.length).toBeGreaterThan(0)
   })
 
@@ -614,9 +614,9 @@ describe('planRemoteInstall 的 release 候选选择', () => {
     const plan = await planRemoteInstall('Linux x86_64', {}, {
       listReleases: failing,
       listAssets: failing,
-      probe: async url => (url.includes('43078653398') ? 'available' : 'missing'),
+      probe: async url => (url.includes('44422722515') ? 'available' : 'missing'),
     })
-    expect(zipPlanOf(plan).tag).toBe('dsh-0.2.2-rc.1-43078653398')
+    expect(zipPlanOf(plan).tag).toBe('dsh-0.2.2-rc.5-44422722515')
   })
 })
 
@@ -630,7 +630,7 @@ describe('install 脚本的重新安装短路', () => {
       dshEntry: 'node_modules/@deepseek-ai/dsh/lib/bin.js',
       dshVersion: '0.2.2-rc.1',
       node: { urls: ['https://example.invalid/node.tar.gz'], shasumUrls: ['https://example.invalid/SHASUMS256.txt'], shasumSha256: 'a'.repeat(64), filename: 'node-v22.22.0-linux-x64.tar.gz', version: 'v22.22.0' },
-      dsh: { kind: 'pkg-zip', urls: ['https://example.invalid/dsh.zip'], digest: 'sha256:bb', zipName: 'deepseek-harness-pkg-linux.zip', tag: 'dsh-0.2.2-rc.1-43078653398' },
+      dsh: { kind: 'pkg-zip', urls: ['https://example.invalid/dsh.zip'], digest: 'sha256:bb', zipName: 'deepseek-harness-pkg-linux.zip', tag: 'dsh-0.2.2-rc.5-44422722515' },
       pnpm: { urls: ['https://example.invalid/pnpm.tgz'], sha256: 'c'.repeat(64), version: '11.7.0' },
       notes: [],
     }
@@ -656,7 +656,7 @@ describe('install 脚本的重新安装短路', () => {
     const script = buildInstallScript(zipPlan(), { force: true })
     expect(script.split('\n').slice(0, 2)).toEqual(['set -eu', 'REINSTALL=1'])
     expect(script).toContain('if [ -f "$ROOT/dependencies/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js" ] && [ -z "$REINSTALL" ]; then')
-    expect(script).toContain('log download "dsh dsh-0.2.2-rc.1-43078653398"')
+    expect(script).toContain('log download "dsh dsh-0.2.2-rc.5-44422722515"')
   })
 
   it('强制重装时 npm-tgz 布局同样绕过短路', () => {

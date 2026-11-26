@@ -27,7 +27,9 @@ afterEach(() => {
     rmSync(home, { recursive: true, force: true })
 })
 
-describe('remote core copy probe', () => {
+const shAvailable = spawnSync('sh', ['-c', 'true']).status === 0
+
+describe.skipIf(!shAvailable)('remote core copy probe', () => {
   it('skips staging directories and directories without a core entry', () => {
     const { home, deps } = fixtureHome()
     completeCopy(deps, 'dsh', '0.2.2-rc.1')

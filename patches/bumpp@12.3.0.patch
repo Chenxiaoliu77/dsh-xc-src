@@ -1,8 +1,8 @@
-diff --git a/dist/config-uYUPRhMz.mjs b/dist/config-uYUPRhMz.mjs
-index 8faa3939..abd3a653 100644
---- a/dist/config-uYUPRhMz.mjs
-+++ b/dist/config-uYUPRhMz.mjs
-@@ -6304,6 +6304,10 @@ async function updateFile(relPath, operation) {
+diff --git a/dist/config-CadB_BQ2.mjs b/dist/config-CadB_BQ2.mjs
+index 1f3e36b62effcd93b29bff371583121275ec6bf4..82190892e80d01e3eac67941775188b3bd5927a0 100644
+--- a/dist/config-CadB_BQ2.mjs
++++ b/dist/config-CadB_BQ2.mjs
+@@ -6363,6 +6363,10 @@ async function updateFile(relPath, operation) {
  		case "jsr.jsonc":
  		case "deno.json":
  		case "deno.jsonc": return updateManifestFile(relPath, operation);
@@ -13,31 +13,28 @@ index 8faa3939..abd3a653 100644
  		default: return updateTextFile(relPath, operation);
  	}
  }
-@@ -6320,7 +6324,9 @@ async function updateManifestFile(relPath, operation) {
+@@ -6379,7 +6383,8 @@ async function updateManifestFile(relPath, operation) {
  	const { newVersion } = operation.state;
  	let modified = false;
  	const file = await readJsoncFile(relPath, cwd);
 -	if (!isManifest(file.data)) return modified;
-+	// Support files with only a version field (like tauri.conf.json)
 +	const hasVersion = file.data && typeof file.data === "object" && typeof file.data.version === "string";
 +	if (!isManifest(file.data) && !hasVersion) return modified;
  	if (file.data.version == null) return modified;
  	if (file.data.version !== newVersion) {
  		file.modified.push([["version"], newVersion]);
-@@ -6335,6 +6341,94 @@ async function updateManifestFile(relPath, operation) {
- 	return modified;
- }
- /**
-+* Updates the version number in src-tauri/Cargo.toml (only the [package] section).
-+*
-+* @returns - `true` if the file was actually modified
+@@ -6398,6 +6403,77 @@ async function updateManifestFile(relPath, operation) {
+ *
+ * @returns - `true` if the file was actually modified
+ */
++/**
++* Updates the version number in Cargo.toml (only the [package] section).
 +*/
 +async function updateCargoToml(relPath, operation) {
 +	const { cwd } = operation.options;
 +	const { currentVersion, newVersion } = operation.state;
 +	let modified = false;
 +	const file = await readTextFile(relPath, cwd);
-+	// Match version in [package] section: version = "x.y.z"
 +	const versionPattern = new RegExp(`(^\\s*version\\s*=\\s*["']?)${currentVersion.replace(/(\W)/g, "\\$1")}(["']?\\s*$)`, "m");
 +	if (versionPattern.test(file.data)) {
 +		file.data = file.data.replace(versionPattern, `$1${newVersion}$2`);
@@ -47,17 +44,13 @@ index 8faa3939..abd3a653 100644
 +	return modified;
 +}
 +/**
-+* Updates the version number in src-tauri/Cargo.lock (only the main package).
-+*
-+* @returns - `true` if the file was actually modified
++* Updates the version number in Cargo.lock (only the main package).
 +*/
 +async function updateCargoLock(relPath, operation) {
 +	const { cwd } = operation.options;
 +	const { currentVersion, newVersion } = operation.state;
 +	let modified = false;
 +	const file = await readTextFile(relPath, cwd);
-+	// Only update the main package version, not dependencies.
-+	// Read the package name from Cargo.toml to identify the main package.
 +	const lockDir = path$1.dirname(path$1.join(cwd, relPath));
 +	const cargoTomlPath = path$1.join(lockDir, "Cargo.toml");
 +	let packageName = null;
@@ -65,13 +58,9 @@ index 8faa3939..abd3a653 100644
 +		const cargoTomlRelPath = path$1.relative(cwd, cargoTomlPath);
 +		const cargoTomlContent = await readTextFile(cargoTomlRelPath, cwd);
 +		const nameMatch = cargoTomlContent.data.match(/^name\s*=\s*["']([^"']+)["']/m);
-+		if (nameMatch) {
-+			packageName = nameMatch[1];
-+		}
++		if (nameMatch) packageName = nameMatch[1];
 +	}
 +	if (packageName) {
-+		// Match version only for the main package: [[package]] followed by
-+		// name = "package-name" followed by version = "x.y.z"
 +		const escapedPackageName = packageName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 +		const escapedCurrentVersion = currentVersion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 +		const mainPackagePattern = new RegExp(`(\\[\\[package\\]\\][\\s\\S]*?name\\s*=\\s*["']${escapedPackageName}["'][\\s\\S]*?version\\s*=\\s*["']?)${escapedCurrentVersion}(["'])`, "m");
@@ -81,11 +70,10 @@ index 8faa3939..abd3a653 100644
 +			modified = true;
 +		}
 +	} else {
-+		// Fallback: only replace the first occurrence (likely the main package)
 +		const escapedCurrentVersion = currentVersion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-+		const versionPattern = new RegExp(`(^version\\s*=\\s*["']?)${escapedCurrentVersion}(["']\\s*$)`, "m");
++		const versionPattern = new RegExp(`version\\s*=\\s*["']${escapedCurrentVersion}["']`, "m");
 +		if (versionPattern.test(file.data)) {
-+			file.data = file.data.replace(versionPattern, `$1${newVersion}$2`);
++			file.data = file.data.replace(versionPattern, `version = "${newVersion}"`);
 +			await writeTextFile(file);
 +			modified = true;
 +		}
@@ -93,29 +81,23 @@ index 8faa3939..abd3a653 100644
 +	return modified;
 +}
 +/**
-+* Updates app.json: `expo.version` follows the desktop version and
-+* `expo.android.versionCode` is incremented by one (Android requires a strictly
-+* increasing versionCode; the historical rule is +1 per version change).
-+*
-+* @returns - `true` if the file was actually modified
++* Updates the version number in Expo app.json (expo.version).
 +*/
 +async function updateExpoAppConfig(relPath, operation) {
 +	const { cwd } = operation.options;
-+	const { newVersion } = operation.state;
++	const { currentVersion, newVersion } = operation.state;
 +	let modified = false;
 +	const file = await readJsoncFile(relPath, cwd);
-+	const expo = file.data?.expo;
-+	if (!expo || typeof expo !== "object" || Array.isArray(expo)) return modified;
-+	const versionCode = expo.android?.versionCode;
-+	if (typeof expo.version !== "string" || !Number.isInteger(versionCode) || versionCode < 1) return modified;
-+	if (expo.version === newVersion) return modified;
-+	file.modified.push([["expo", "version"], newVersion]);
-+	file.modified.push([["expo", "android", "versionCode"], versionCode + 1]);
-+	await writeJsoncFile(file);
-+	modified = true;
++	if (file.data && typeof file.data === "object" && file.data.expo && typeof file.data.expo.version === "string") {
++		if (file.data.expo.version !== newVersion) {
++			file.data.expo.version = newVersion;
++			file.modified.push([["expo", "version"], newVersion]);
++			await writeJsoncFile(file);
++			modified = true;
++		}
++	}
 +	return modified;
 +}
-+/**
- * Updates all occurrences of the version number in the specified text file.
- *
- * @returns - `true` if the file was actually modified
+ async function updateTextFile(relPath, operation) {
+ 	const { cwd } = operation.options;
+ 	const { currentVersion, newVersion } = operation.state;

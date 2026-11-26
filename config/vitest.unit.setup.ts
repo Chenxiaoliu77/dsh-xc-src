@@ -23,6 +23,12 @@ function escape(value: string): string {
   return result
 }
 
+// Node 22+ 的实验性 localStorage（未配 --localstorage-file 时不可用）会遮蔽 jsdom 的实现，先移除。
+try { delete (globalThis as { localStorage?: unknown }).localStorage } catch {}
+if (typeof window !== 'undefined' && window !== (globalThis as unknown)) {
+  try { delete (window as unknown as { localStorage?: unknown }).localStorage } catch {}
+}
+
 if (typeof window !== 'undefined') {
   const css = window.CSS ?? (window.CSS = {} as typeof CSS)
   css.escape ??= escape
@@ -32,7 +38,7 @@ if (typeof window !== 'undefined') {
 
   // jsdom 的 localStorage 只实现了部分接口，测试会用到 clear 与写入。
   const storage = globalThis.localStorage as Storage | undefined
-  if (storage !== undefined) {
+  if (true) {
     const items = new Map<string, string>()
     const complete: Storage = {
       get length() { return items.size },
