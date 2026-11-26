@@ -131,3 +131,5 @@
 3. **POSIX 测试门控收紧**：槽位锁/token/sh 用例门控统一为 `process.platform !== 'win32'`（commit 3b43016），本机跳过、CI/Linux 照常执行。
 
 > 注：下一版（0.34.1+）安装器才会带上主进程退出修复；当前 0.34.0 用户手动更新仍可能看到一次占用弹窗，点「重试」或先退出应用再装即可。
+4. **公开源码敏感扫描结论（2026-11-26）**：九类特征（私钥块、GitHub/AWS/API/Anthropic 令牌、secret、password、真实 .env、内网 IP、提交者邮箱）全仓扫描——全部清白。唯一命中：①.git 对象里的提交者邮箱 775955621@qq.com 已随历史公开（P2，可选 git filter-repo 重写历史或接受现状）；②testflight 脚本中的 "-----BEGIN PRIVATE KEY" 是校验字符串非真实密钥。无需回滚处理。
+5. **0.34.1 构建**：本地版本线从 0.33.0 直升 0.34.1（6 个版本文件 + Cargo.lock 同步，cargo check --locked 全绿，commit 8bc8a3d），包含安装退出修复（ef72997）与全部自有化改动；完整构建（build:plugins → tauri build）后台进行中。
