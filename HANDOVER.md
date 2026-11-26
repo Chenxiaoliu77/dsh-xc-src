@@ -95,7 +95,7 @@
 3. ~~依赖更新~~ ✅ pnpm 锁文件已对齐（catalogs 全部生效，supply-chain 校验通过）。
 4. ~~验证~~ ✅ cargo check --locked / typecheck / lint / 单测全部通过。
 5. ~~提交推送~~ ✅ 已提交 `b9cf4ce`（17 files, +636/-456）并推送至 `Chenxiaoliu77/dsh-xc-zuomian` 的 `source` 分支。
-6. **收尾**：用新版品牌安装包做一次端到端更新验证（从自有仓库拉取 → 安装 → 启动）。
+6. ~~收尾~~ ✅ 端到端更新回归已通过（2026-11-26）：已装 0.33.0 启动后自动检测到自有仓库 v0.34.0，下载 `DSH.XC_0.34.0_x64-setup.exe`（126,771,649B）并独立复核 SHA-256 一致（f0c9cda2…d951），安装交接器就绪；同时验证了 v0.33.0 资产下载校验（e860f8ce…250a）与三类更新端点（releases.atom 200 / kernel latest 302 / setup 直链 302→CDN）。
 
 ## 7. 风险与注意事项
 
