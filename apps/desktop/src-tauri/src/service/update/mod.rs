@@ -60,6 +60,8 @@ pub fn clear_pending_installer(app_handle: &crate::AppHandle) {
 
 /// 仓库主页（同时用于构造 atom / expanded_assets / 下载地址）
 const REPO_URL: &str = "https://github.com/Chenxiaoliu77/dsh-xc-release";
+/// 源代码仓库（关于对话框「源代码」链接；release 仓库只放资产，源码镜像在此）
+pub(crate) const SOURCE_URL: &str = "https://github.com/Chenxiaoliu77/dsh-xc-src";
 /// 版权信息（与 tauri.conf.json bundle.copyright 保持一致）
 const COPYRIGHT: &str = "Copyright © 2026 DSH XC contributors";
 /// About 对话框的 "Powered by" 文案
