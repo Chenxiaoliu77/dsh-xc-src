@@ -1,7 +1,8 @@
 name: Verify Release Assets
 
-# 发布资产完整性闸门：校验每个 release 的 installer 与 .sha256 资产是否配对且哈希一致。
-# 独立工作流、只读权限，不干扰现有 release/build 流程（issue: 0.34.1 sha256 资产曾残缺 29B）。
+# 发布资产完整性双保险：release.yml 的 verify-assets 在发布前校验本地产物，
+# 本工作流在 release: published 后下载真实产物做独立端到端复查（配对 + 字节哈希 + 正文哈希）。
+# 只读权限，不干扰现有 release/build 流程（issue: 0.34.1 sha256 资产曾残缺 29B）。
 on:
   workflow_dispatch:
     inputs:
@@ -29,11 +30,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Verify assets
+      - name: Verify published assets end-to-end
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_REPO: ${{ github.repository }}
         run: |
           TAG="${{ github.event.release.tag_name || inputs.tag }}"
-          echo "Verifying release assets for tag: $TAG"
-          node .github/scripts/verify-release-assets.mjs --tag "$TAG" --checksum-only
+          echo "Cross-checking published release assets for tag: $TAG"
+          echo "(independent post-publish check: download installer, verify bytes against .sha256 and release body)"
+          node .github/scripts/verify-release-assets.mjs --tag "$TAG"

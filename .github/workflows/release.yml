@@ -203,21 +203,11 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Verify gate self-test
+        run: node .github/scripts/verify-local-assets.mjs --self-test
+
       - name: Verify installer/sha256 pairs
-        run: |
-          set -euo pipefail
-          mapfile -d '' installers < <(find release-assets -type f \(
-            -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb'
-          \) -print0)
-          [ "${#installers[@]}" -gt 0 ] || { echo '::error::no installers to verify'; exit 1; }
-          for installer in "${installers[@]}"; do
-            checksum="${installer}.sha256"
-            [ -f "$checksum" ] || { echo "::error::missing checksum for $installer"; exit 1; }
-            expected="$(awk '{print $1}' "$checksum")"
-            actual="$(sha256sum "$installer" | awk '{print $1}')"
-            [ "$expected" = "$actual" ] || { echo "::error::sha256 mismatch for $installer"; exit 1; }
-            echo "verified $installer"
-          done
+        run: node .github/scripts/verify-local-assets.mjs --dir release-assets
 
   finalize:
     name: Publish GitHub Release

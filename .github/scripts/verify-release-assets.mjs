@@ -92,13 +92,15 @@ try {
     releaseBody = release.body || ''
     const assets = release.assets || []
     const installer = assets.find(a => /setup\.exe$/i.test(a.name))
-    const checksum = assets.find(a => a.name.endsWith('.sha256'))
-    if (!installer)
+    if (!installer) {
       fail(`installer asset not found in release ${tag}`)
-    if (!checksum)
-      fail(`sha256 asset not found in release ${tag}`)
-    if (!installer || !checksum)
       throw new Error('assets missing')
+    }
+    const checksum = assets.find(a => a.name === `${installer.name}.sha256`)
+    if (!checksum) {
+      fail(`paired sha256 asset not found for ${installer.name} in release ${tag}`)
+      throw new Error('assets missing')
+    }
     installerName = installer.name
     installerSize = installer.size
     installerUrl = installer.browser_download_url
