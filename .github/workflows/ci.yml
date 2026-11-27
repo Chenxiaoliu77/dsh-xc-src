@@ -34,6 +34,34 @@ jobs:
           skip_after_successful_duplicate: true
           paths_ignore: '["**/docs/**", "**/*.md"]'
 
+  unwrap-budget:
+    name: unwrap() budget ratchet
+    needs: pre_job
+    if: ${{ needs.pre_job.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify unwrap/expect count has not regressed
+        run: node scripts/check-unwrap-budget.mjs check
+
+  version-consistency:
+    name: Release version consistency
+    needs: pre_job
+    if: ${{ needs.pre_job.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify all release version files agree
+        run: node --input-type=module -e "import { readReleaseIdentity } from './scripts/release-identity.mjs'; console.log(JSON.stringify(readReleaseIdentity(process.cwd()).versions))"
+
   asset-gate-selftest:
     name: Release asset gate self-test
     needs: pre_job

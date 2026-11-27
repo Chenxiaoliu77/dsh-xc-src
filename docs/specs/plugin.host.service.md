@@ -2,7 +2,7 @@
 
 # 插件宿主端领域服务协议 (Plugin Host Service Protocol)
 
-> 本规范为 [plugin.host.md](./plugin.host.md) 的**子协议**，整体受 [devlopment.md](./devlopment.md) 约束[cite: 1]。
+> 本规范为 [plugin.host.md](./plugin.host.md) 的**子协议**，整体受 [development.md](./development.md) 约束[cite: 1]。
 > **适用范围**：`packages/*/src/host/service/`[cite: 1]。
 > **核心原则**：通过 **「单一导出 + 动词白名单 + 统一签名」** 消除同义冗余、参数散装与职责穿透[cite: 1]。
 

@@ -26,7 +26,7 @@
 | `dsh-tauri-ui` | primitives、ui-layout、hero/settings slots | StateDot 修复由官方实现承接；新增 InlineEditor 与 `shell.bottom` 不要求本地新增 UI |
 | `dsh-tauri-worktree` | semantic draft 与 session input | 迁移及回滚完整 `{ text, references }`，保留引用身份、顺序、标点与换行；语义输入存在但暂取不到 snapshot 时，在建目标/清源前失败；旧内核保留文本动作 |
 
-根 `THIRD_PARTY_NOTICES.md` 仅更新表格中的 Harness 版本与 hash。各包保留旧同步历史、许可证和其他上游 pin，并追加本轮兼容结论。`docs/specs/upstram.sync.md` 标为固定文档，本轮不改；当前基线以子模块、依赖、声明索引及本包日志为准。
+根 `THIRD_PARTY_NOTICES.md` 仅更新表格中的 Harness 版本与 hash。各包保留旧同步历史、许可证和其他上游 pin，并追加本轮兼容结论。`docs/specs/upstream.sync.md` 标为固定文档，本轮不改；当前基线以子模块、依赖、声明索引及本包日志为准。
 
 ## 七类接缝
 

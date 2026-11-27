@@ -98,7 +98,7 @@ Upgrade flow: merge upstream → `node .temp/dsh-xc-kit/scripts/apply-brand.mjs`
 
 These are enforced project rules, not preferences (`AGENTS.md` is authoritative):
 
-- **Spec routing.** Read and stack the matching spec from `docs/specs/` before analysing or changing code. `devlopment.md` applies to everything; module specs override it on conflict.
+- **Spec routing.** Read and stack the matching spec from `docs/specs/` before analysing or changing code. `development.md` applies to everything; module specs override it on conflict.
 - **Zero comments.** Code should explain itself. Reserve comments for genuinely non-obvious algorithms; delete stale narrative comments while refactoring.
 - **Scratch space.** Intermediate analysis and drafts go in `.temp/`.
 - **Submodule discipline.** `crates/*` commits land before the pointer update in this repository.

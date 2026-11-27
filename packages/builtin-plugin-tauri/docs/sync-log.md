@@ -2,7 +2,7 @@
 
 记录 `dsh-tauri` 与内核 [`deepseek-ai/deepseek-harness`](https://github.com/deepseek-ai/deepseek-harness)（`source/deepseek-harness`）的宿主契约对照进度。
 
-按 `docs/specs/upstram.sync.md` §1.2，内核属「必须兼容的运行时依赖」，本日志只登记**载体契约**（`dshDesktop` 标记、index 注入行、鉴权闸门、`__DSH_BOOT__`），不参与择优移植。
+按 `docs/specs/upstream.sync.md` §1.2，内核属「必须兼容的运行时依赖」，本日志只登记**载体契约**（`dshDesktop` 标记、index 注入行、鉴权闸门、`__DSH_BOOT__`），不参与择优移植。
 
 ## 当前状态
 

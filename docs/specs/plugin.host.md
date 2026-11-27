@@ -2,7 +2,7 @@
 
 # 插件宿主端架构规范 (Plugin Host Architecture Protocol)
 
-> 本规范为 [devlopment.md](./devlopment.md) 在 **DeepSeek Harness 插件宿主端（Node Runtime）** 的落地协议。插件 `src/host` 实现必须严格遵守本规范。
+> 本规范为 [development.md](./development.md) 在 **DeepSeek Harness 插件宿主端（Node Runtime）** 的落地协议。插件 `src/host` 实现必须严格遵守本规范。
 > **服务层细则**见：[plugin.host.service.md](./plugin.host.service.md)（定义宏、动词白名单与签名铁律）。
 
 ---

@@ -51,9 +51,20 @@ const STAMPED_FILES = [
       replaceOnce(content, /^(\s*"version"\s*:\s*")[^"]*(")/m, `$1${version}$2`, label),
   },
   {
+    label: 'apps/desktop/package.json',
+    segments: ['apps/desktop', 'package.json'],
+    stamp: (content, version, label) =>
+      replaceOnce(content, /^(\s*"version"\s*:\s*")[^"]*(")/m, `$1${version}$2`, label),
+  },
+  {
     label: 'apps/desktop/src-tauri/Cargo.toml',
     segments: ['apps/desktop/src-tauri', 'Cargo.toml'],
     stamp: stampCargoToml,
+  },
+  {
+    label: 'apps/desktop/src-tauri/Cargo.lock',
+    segments: ['apps/desktop/src-tauri', 'Cargo.lock'],
+    stamp: stampCargoLock,
   },
   {
     label: 'apps/desktop/src-tauri/tauri.conf.json',
@@ -62,6 +73,25 @@ const STAMPED_FILES = [
       replaceOnce(content, /^(\s*"version"\s*:\s*")[^"]*(")/m, `$1${version}$2`, label),
   },
 ]
+
+function stampCargoLock(content, version, _label) {
+  const root = process.env.GITHUB_WORKSPACE || process.cwd()
+  const cargoToml = readFileSync(path.join(root, 'apps/desktop/src-tauri', 'Cargo.toml'), 'utf8')
+  const name = /^\s*name\s*=\s*"([^"]+)"\s*$/m.exec(cargoToml)
+  if (!name)
+    throw stampError('Cargo.toml [package] name is missing')
+  const blocks = content.split('[[package]]')
+  let hits = 0
+  const stamped = blocks.map((block, index) => {
+    if (index === 0 || !new RegExp(`^\\s*name\\s*=\\s*"${name[1]}"\\s*$`, 'm').test(block))
+      return block
+    hits += 1
+    return block.replace(/^(\s*version\s*=\s*")[^"]*(")/m, `$1${version}$2`)
+  })
+  if (hits !== 1)
+    throw stampError(`Cargo.lock: expected exactly one [package] block for ${name[1]}, found ${hits}`)
+  return stamped.join('[[package]]')
+}
 
 function parseStampedVersion(version) {
   try {
@@ -127,4 +157,4 @@ if (entryPoint && import.meta.url === pathToFileURL(path.resolve(entryPoint)).hr
   }
 }
 
-export { stampCargoToml, stampVersion }
+export { stampCargoLock, stampCargoToml, stampVersion }

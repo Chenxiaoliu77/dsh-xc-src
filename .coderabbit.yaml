@@ -59,7 +59,7 @@ reviews:
         - 要压掉 clippy 告警用 `#[expect(clippy::...)]` 并写原因，不要用 `#[allow(...)]` 一按了之。
     - path: 'apps/desktop/src-tauri/src/**/*.rs'
       instructions: |
-        Rust 正确性（沿用 docs/specs/desktop.baisc.md §5，补充 rust-best-practices）：
+        Rust 正确性（沿用 docs/specs/desktop.basic.md §5，补充 rust-best-practices）：
         - `Result<_, String>` 的错误串必须带大写前缀（如 `NODE_NOT_FOUND: ...`），否则上层无法按码分支；别在这里引入 anyhow 把可分类错误抹平。
         - Windows 子进程启动必须带 `CREATE_NO_WINDOW (0x08000000)`，否则会弹出控制台窗口。
         - 停止服务必须用 `taskkill /T /F` 杀进程树，避免残留进程锁死 DLL。

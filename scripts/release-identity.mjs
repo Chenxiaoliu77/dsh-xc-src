@@ -84,12 +84,28 @@ function readCargoPackageVersion(content) {
   return packageVersion
 }
 
+function readCargoLockPackageVersion(content, packageName) {
+  if (typeof content !== 'string')
+    throw releaseIdentityError('Cargo.lock content must be a string')
+  const blocks = content.split('[[package]]').slice(1)
+  const pattern = new RegExp(`^\\s*name\\s*=\\s*"${packageName}"\\s*$`, 'm')
+  const matches = blocks.filter(block => pattern.test(block))
+  if (matches.length !== 1)
+    throw releaseIdentityError(`Cargo.lock expects exactly one [package] block for ${packageName}, found ${matches.length}`)
+  const version = /^\s*version\s*=\s*"([^"]+)"\s*$/m.exec(matches[0])
+  if (!version)
+    throw releaseIdentityError(`Cargo.lock [package] ${packageName} version is missing`)
+  parseSemver(version[1], `Cargo.lock ${packageName} version`)
+  return version[1]
+}
+
 function readReleaseIdentity(repo = process.cwd()) {
   const packageVersion = readJsonVersion(path.join(repo, 'package.json'), 'package.json')
   const cargoPath = path.join(repo, 'apps/desktop/src-tauri', 'Cargo.toml')
+  const cargoSource = readFileSync(cargoPath, 'utf8')
   let cargoVersion
   try {
-    cargoVersion = readCargoPackageVersion(readFileSync(cargoPath, 'utf8'))
+    cargoVersion = readCargoPackageVersion(cargoSource)
   }
   catch (error) {
     if (error instanceof Error && error.message.startsWith('RELEASE_IDENTITY:'))
@@ -101,9 +117,28 @@ function readReleaseIdentity(repo = process.cwd()) {
     'apps/desktop/src-tauri/tauri.conf.json',
   )
 
+  const cargoName = /^\s*name\s*=\s*"([^"]+)"\s*$/m.exec(cargoSource)
+  if (!cargoName)
+    throw releaseIdentityError('Cargo.toml [package] name is missing')
+  const lockPath = path.join(repo, 'apps/desktop/src-tauri', 'Cargo.lock')
+  let lockVersion
+  try {
+    lockVersion = readCargoLockPackageVersion(readFileSync(lockPath, 'utf8'), cargoName[1])
+  }
+  catch (error) {
+    if (error instanceof Error && error.message.startsWith('RELEASE_IDENTITY:'))
+      throw error
+    throw releaseIdentityError(`cannot read Cargo.lock at ${lockPath}`, error)
+  }
+  const desktopPackageVersion = readJsonVersion(
+    path.join(repo, 'apps/desktop', 'package.json'),
+    'apps/desktop/package.json',
+  )
   const versions = {
     'package.json': packageVersion,
+    'apps/desktop/package.json': desktopPackageVersion,
     'apps/desktop/src-tauri/Cargo.toml': cargoVersion,
+    'apps/desktop/src-tauri/Cargo.lock': lockVersion,
     'apps/desktop/src-tauri/tauri.conf.json': tauriVersion,
   }
   if (new Set(Object.values(versions)).size !== 1) {
@@ -213,6 +248,7 @@ if (entryPoint && import.meta.url === pathToFileURL(path.resolve(entryPoint)).hr
 export {
   deriveReleaseMetadata,
   parseSemver,
+  readCargoLockPackageVersion,
   readCargoPackageVersion,
   readReleaseIdentity,
 }

@@ -1,7 +1,7 @@
 # 桌面端 UI 组件规范 (Desktop UI Component Protocol)
 
 > **适用范围**：`src/ui/**` 与 `src/components/**` 下的 React 组件（设置面板、对话框、独立视图）。
-> 本规范是 [devlopment.md](./devlopment.md) 与 [desktop.baisc.md](./desktop.baisc.md)（§3 前端编码规范）在**组件实现粒度**上的补充：结构性规则看那两份，**组件内部怎么组织**看这份。
+> 本规范是 [development.md](./development.md) 与 [desktop.basic.md](./desktop.basic.md)（§3 前端编码规范）在**组件实现粒度**上的补充：结构性规则看那两份，**组件内部怎么组织**看这份。
 
 ---
 

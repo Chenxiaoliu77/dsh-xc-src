@@ -2,7 +2,7 @@
 
 # 插件客户端架构规范 (Plugin Client Architecture Protocol)
 
-> 本规范是 [通用软件开发规范与协议 (devlopment.md)](./devlopment.md)[cite: 1] 在 **DeepSeek Harness 插件客户端半区（Browser Runtime）** 的具象化工程落地协议。所有插件的 `src/client` 实现必须严格遵循本规范。
+> 本规范是 [通用软件开发规范与协议 (development.md)](./development.md)[cite: 1] 在 **DeepSeek Harness 插件客户端半区（Browser Runtime）** 的具象化工程落地协议。所有插件的 `src/client` 实现必须严格遵循本规范。
 > **姊妹协议**：[插件宿主端架构规范 (plugin.host.md)](./plugin.host.md)[cite: 2] 与 [插件宿主端领域服务协议 (plugin.host.service.md)](./plugin.host.service.md)。两端共享 SSOT、零无用中间层与单向依赖流哲学[cite: 2]，但客户端使用 React 与浏览器生命周期词汇表。
 
 ---
