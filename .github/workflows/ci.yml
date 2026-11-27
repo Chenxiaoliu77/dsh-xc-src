@@ -34,6 +34,20 @@ jobs:
           skip_after_successful_duplicate: true
           paths_ignore: '["**/docs/**", "**/*.md"]'
 
+  asset-gate-selftest:
+    name: Release asset gate self-test
+    needs: pre_job
+    if: ${{ needs.pre_job.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify gate logic
+        run: node .github/scripts/verify-local-assets.mjs --self-test
+
   # 子仓库指针一致性前置（issue #1384）：发布顺序出错时，指针会先于子仓库推送，
   # 之后所有平台的 Checkout 会各自报一遍 `not our ref`，看起来像 5 个平台同时崩。
   # 这里先用 `git ls-remote` 逐个确认指针在远端可达，不可达立刻以明确信息失败，
