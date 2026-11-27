@@ -1,4 +1,5 @@
-import { existsSync, readdirSync, readFileSync, renameSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
 import { readReleaseIdentity } from './release-identity.mjs'
@@ -29,7 +30,11 @@ for (const directory of directories) {
     const target = path.join(directory, assetPrefix + file.name.slice(sourcePrefix.length))
     if (existsSync(target))
       throw new Error(`RELEASE_ASSET_EXISTS: ${target}`)
-    console.log(`${path.join(directory, file.name)} -> ${target}`)
-    renameSync(path.join(directory, file.name), target)
+    const source = path.join(directory, file.name)
+    console.log(`${source} -> ${target}`)
+    renameSync(source, target)
+    const hash = createHash('sha256')
+    hash.update(readFileSync(target))
+    writeFileSync(`${target}.sha256`, `${hash.digest('hex')} *${path.basename(target)}\n`)
   }
 }

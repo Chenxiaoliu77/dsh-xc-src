@@ -181,11 +181,49 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
   # 单一 writer 下载全部成功构建的产物，一次性上传并发布 Release。
-  finalize:
-    name: Publish GitHub Release
+  verify-assets:
+    name: Verify release asset integrity
     needs: [prepare, build-macos, build-windows, build-linux]
     if: >-
       always() && needs.prepare.result == 'success' &&
+      ((github.event_name != 'workflow_dispatch' &&
+        needs.build-macos.result == 'success' &&
+        needs.build-windows.result == 'success' &&
+        needs.build-linux.result == 'success') ||
+       (github.event_name == 'workflow_dispatch' &&
+        (needs.build-macos.result == 'success' || needs.build-macos.result == 'skipped') &&
+        (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped') &&
+        (needs.build-linux.result == 'success' || needs.build-linux.result == 'skipped')))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build outputs
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify installer/sha256 pairs
+        run: |
+          set -euo pipefail
+          mapfile -d '' installers < <(find release-assets -type f \(
+            -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb'
+          \) -print0)
+          [ "${#installers[@]}" -gt 0 ] || { echo '::error::no installers to verify'; exit 1; }
+          for installer in "${installers[@]}"; do
+            checksum="${installer}.sha256"
+            [ -f "$checksum" ] || { echo "::error::missing checksum for $installer"; exit 1; }
+            expected="$(awk '{print $1}' "$checksum")"
+            actual="$(sha256sum "$installer" | awk '{print $1}')"
+            [ "$expected" = "$actual" ] || { echo "::error::sha256 mismatch for $installer"; exit 1; }
+            echo "verified $installer"
+          done
+
+  finalize:
+    name: Publish GitHub Release
+    needs: [prepare, build-macos, build-windows, build-linux, verify-assets]
+    if: >-
+      always() && needs.prepare.result == 'success' && needs.verify-assets.result == 'success' &&
       ((github.event_name != 'workflow_dispatch' &&
         needs.build-macos.result == 'success' &&
         needs.build-windows.result == 'success' &&

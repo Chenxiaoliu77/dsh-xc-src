@@ -202,6 +202,8 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: release-${{ matrix.id }}
-          path: apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          path: |
+            apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.sha256
           if-no-files-found: error
           retention-days: 7
